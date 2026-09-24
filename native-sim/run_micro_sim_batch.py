@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -162,12 +163,12 @@ def require_ok(cmd: list[str]) -> None:
         raise RuntimeError(f"{' '.join(cmd)} failed\n{detail}")
 
 
-def native_object_path(name: str, native_build_dir: Path) -> Path:
-    for suffix in (".native.o", ".native.so"):
-        path = native_build_dir / f"{name}{suffix}"
-        if path.is_file():
-            return path
-    raise RuntimeError(f"missing native object for {name} in {native_build_dir}")
+def native_object_path(name: str, native_build_dir: Path, *, stage2: bool) -> Path:
+    suffix = ".native.o" if stage2 else ".native.so"
+    path = native_build_dir / f"{name}{suffix}"
+    if not path.is_file():
+        raise RuntimeError(f"missing native object: {path}")
+    return path
 
 
 def native_entry_symbol(objdump: str, native_obj: Path, symbols: list[str]) -> str:
@@ -192,20 +193,29 @@ def build_proof_objects(
     proof_object_dir = config.source_dir / "build" / "native-link"
     proof_object_dir.mkdir(parents=True, exist_ok=True)
     for bench in benches:
-        native_obj = native_object_path(bench.name, native_build_dir)
+        native_obj = native_object_path(bench.name, native_build_dir, stage2=bench.stage2)
         symbol = native_entry_symbol(
             config.objdump,
             native_obj,
             [bench.name, f"{bench.name}_xdp", f"{bench.name}_prog"],
         )
         proof_obj = proof_object_dir / f"{bench.name}.proof.o"
-        require_ok([
+        command = [
             str(NATIVE_LINK_BIN),
             "--input", str(native_obj),
             "--symbol", symbol,
             "--output", str(proof_obj),
             "--mode", "proof",
-        ])
+        ]
+        native_sha256 = hashlib.sha256(native_obj.read_bytes()).hexdigest()
+        require_ok(command)
+        proof_obj.with_suffix(".json").write_text(json.dumps({
+            "native_object": str(native_obj),
+            "native_sha256": native_sha256,
+            "entry_symbol": symbol,
+            "proof_sha256": hashlib.sha256(proof_obj.read_bytes()).hexdigest(),
+            "command": command,
+        }, indent=2, sort_keys=True) + "\n")
     return proof_object_dir
 
 

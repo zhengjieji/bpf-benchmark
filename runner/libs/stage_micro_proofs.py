@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,7 +24,16 @@ def stage_proofs(manifest: Path, programs: Path, proofs: Path, output: Path, obj
             raise RuntimeError(f"{native_object}: no native entry symbol from {candidates}")
         # run_micro_sim_batch builds this proof from the same native object and symbol.
         source = proofs / f"{benchmark.name}.proof.o"
+        metadata_path = source.with_suffix(".json")
+        metadata = json.loads(metadata_path.read_text())
+        if metadata["native_sha256"] != hashlib.sha256(native_object.read_bytes()).hexdigest():
+            raise RuntimeError(f"{source}: proof was generated from a different native object")
+        if metadata["entry_symbol"] != symbol:
+            raise RuntimeError(f"{source}: proof entry symbol differs from native object")
+        if metadata["proof_sha256"] != hashlib.sha256(source.read_bytes()).hexdigest():
+            raise RuntimeError(f"{source}: proof does not match its generation metadata")
         shutil.copyfile(source, output / f"{symbol}.proof.o")
+        shutil.copyfile(metadata_path, output / f"{symbol}.proof.json")
 
 
 def main() -> None:

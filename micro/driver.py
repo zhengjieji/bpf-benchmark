@@ -160,12 +160,21 @@ def collect_provenance(
     repo_dirty = _git_is_dirty(ROOT_DIR)
     source_manifest = Path("/artifacts/source-manifest.json")
     build_source = json.loads(source_manifest.read_text()) if source_manifest.is_file() else None
+    kernel_config = Path("/artifacts/kernel/config")
 
     return {
         "kernel_commit": kernel_commit,
         "repo_git_sha": repo_git_sha,
         "repo_dirty": repo_dirty,
         "build_source": build_source,
+        "execution": {
+            "run_token": os.environ.get("RUN_TOKEN"),
+            "executor": os.environ.get("RUN_EXECUTOR"),
+            "target": os.environ.get("RUN_TARGET_NAME"),
+            "target_arch": os.environ.get("RUN_TARGET_ARCH"),
+        },
+        "kernel_config": (file_identity(kernel_config) if kernel_config.is_file()
+                          else {"path": str(kernel_config), "status": "absent"}),
         "params": {
             "samples": samples,
             "warmups": warmups,

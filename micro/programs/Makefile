@@ -34,8 +34,9 @@ KERNEL_BTF_INPUT := $(if $(wildcard $(KERNEL_VMLINUX)),$(KERNEL_VMLINUX),$(if $(
 BPF_DEPS := $(patsubst %.bpf.c,$(OUTPUT_DIR)/%.bpf.d,$(BPF_SRCS))
 NATIVE_SOS := $(patsubst %.bpf.c,$(OUTPUT_DIR)/%.native.so,$(BPF_SRCS))
 NATIVE_DEPS := $(patsubst %.bpf.c,$(OUTPUT_DIR)/%.native.d,$(BPF_SRCS))
+NATIVE_FLAGS_STAMP := $(OUTPUT_DIR)/.native-build-flags
 
-.PHONY: all clean
+.PHONY: all clean native-flags-force
 
 all: $(BPF_OBJS) $(NATIVE_SOS)
 
@@ -106,7 +107,11 @@ endif
 
 $(NATIVE_SOS): $(KERNEL_OFFSETS)
 
-$(OUTPUT_DIR)/%.native.so: %.bpf.c $(KERNEL_OFFSETS) Makefile | $(OUTPUT_DIR)
+$(NATIVE_FLAGS_STAMP): native-flags-force | $(OUTPUT_DIR)
+	@{ printf '%s\n' 'compiler=$(CLANG)' 'flags=$(NATIVE_CFLAGS)'; $(CLANG) --version; } > "$@.tmp"
+	@cmp -s "$@.tmp" "$@" && rm -f "$@.tmp" || mv -f "$@.tmp" "$@"
+
+$(OUTPUT_DIR)/%.native.so: %.bpf.c $(KERNEL_OFFSETS) Makefile $(NATIVE_FLAGS_STAMP) | $(OUTPUT_DIR)
 	$(CLANG) $(NATIVE_CFLAGS) -I"$(OUTPUT_DIR)" -MF "$(OUTPUT_DIR)/$*.native.d" -MT "$@" -o "$@" "$<"
 
 $(OUTPUT_DIR):
@@ -122,6 +127,7 @@ clean:
 			"$(OUTPUT_DIR)"/*.bpf.bin \
 			"$(OUTPUT_DIR)"/*.directive.bin \
 			"$(OUTPUT_DIR)"/*.policy.bin \
+			"$(NATIVE_FLAGS_STAMP)" \
 			"$(OUTPUT_DIR)"/kernel_offsets.h
 
 -include $(BPF_DEPS) $(NATIVE_DEPS)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 import tempfile
@@ -58,6 +59,12 @@ class MicroSamplingTests(unittest.TestCase):
             source = root / "proofs"
             source.mkdir()
             (source / "packet.proof.o").write_bytes(b"packet proof")
+            (root / "packet.native.so").write_bytes(b"native packet")
+            (source / "packet.proof.json").write_text(json.dumps({
+                "native_sha256": hashlib.sha256(b"native packet").hexdigest(),
+                "entry_symbol": "packet_xdp",
+                "proof_sha256": hashlib.sha256(b"packet proof").hexdigest(),
+            }))
             manifest = root / "micro.yaml"
             manifest.write_text(
                 "suite_name: fixture\npaths: {program_dir: programs}\n"
@@ -68,6 +75,11 @@ class MicroSamplingTests(unittest.TestCase):
                 stage_proofs(manifest, root, source, root / "staged", "objdump")
             self.assertEqual((root / "staged" / "packet_xdp.proof.o").read_bytes(), b"packet proof")
             self.assertFalse((root / "staged" / "packet.proof.o").exists())
+            (root / "packet.native.so").write_bytes(b"native recompiled with other flags")
+            with mock.patch("runner.libs.stage_micro_proofs.subprocess.check_output", return_value=
+                            "0000000000001100 g F xdp 0000000000000050 packet_xdp\n"):
+                with self.assertRaisesRegex(RuntimeError, "different native object"):
+                    stage_proofs(manifest, root, source, root / "staged", "objdump")
             with mock.patch("runner.libs.stage_micro_proofs.subprocess.check_output", return_value="other_symbol\n"):
                 with self.assertRaisesRegex(RuntimeError, "no native entry symbol"):
                     stage_proofs(manifest, root, source, root / "staged", "objdump")

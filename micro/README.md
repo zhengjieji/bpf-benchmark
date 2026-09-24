@@ -35,6 +35,18 @@ Run a targeted VM benchmark with current knobs:
 make micro BENCH=simple SAMPLES=1 WARMUPS=0 INNER_REPEAT=10
 ```
 
+For an AWS comparison of the four pure-compute execution paths, use the smaller characterization image:
+
+```bash
+make micro PLATFORM=aws ARCH=x86 MICRO_RUNTIME_PROFILE=characterization RUNTIMES="kernel native_kernel native llvmbpf" SAMPLES=10 WARMUPS=0 WARMUP_REPEAT=5 INNER_REPEAT=100000 SHUFFLE_SEED=20260923
+```
+
+Set the `AWS_X86_*` or `AWS_ARM64_*` connection parameters for your account and an explicit AMI ID. Set `NATIVE_ARCH_CFLAGS` for the measurement CPU when building on another machine; the native build records the flags and compiler identity and rebuilds when either changes. The characterization profile packages these four paths and the default pure-JIT manifest. Other suites and optimization paths use the default full image.
+
+`SAMPLES` counts fresh measured processes per runtime and benchmark. Each process executes `WARMUP_REPEAT` complete batches of `INNER_REPEAT` invocations before timing one further batch. `WARMUPS` retains its separate-process warmup meaning. The default in-process warmup count is five; explicit zero is supported. All four paths in one round use a recorded randomized order. Repeated invocations within a process are not independent statistical samples.
+
+Kernel and native-kernel `exec_ns` use the kernel test-run duration; native and LLVM-BPF use a steady-clock execution-loop duration divided by the measured iteration count. Raw results include the actual iteration counts, warmup counts, order, timestamps, commands, artifact hashes, and execution identity. Statistical analysis and plotting belong outside the benchmark framework. The example sample count is a pilot setting, not a precision guarantee.
+
 ## LLVM KOperation Backend Path
 
 The experimental LLVM backend path compiles the same `programs/*.bpf.c` sources
@@ -90,3 +102,4 @@ Results live under `micro/results/`.
 - Each run lives under `micro/results/<run_type>_<timestamp>/`
 - `metadata.json` is the canonical summary for that run
 - `details/` contains `result.json` plus any retained per-sample payloads
+- AWS machine and image snapshots are retained under `.cache/<target>/results/provenance/` after instance cleanup; join them to micro results using `RUN_TOKEN`.

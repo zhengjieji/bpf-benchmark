@@ -11,10 +11,11 @@ from pathlib import Path
 
 from runner.libs import ROOT_DIR
 from runner.libs import aws_common
+from runner.libs.aws_provenance import capture_snapshot
 from runner.libs.cli_support import fail
 from runner.libs.file_lock import runner_lock
 from runner.libs.run_contract import RunConfig, build_run_config, build_target_config
-from runner.libs.state_file import write_state
+from runner.libs.state_file import write_json_object, write_state
 from runner.libs.suite_commands import build_runtime_container_command, runtime_container_host_dirs
 from runner.libs.workspace_layout import (
     runtime_container_image_tar_path,
@@ -749,17 +750,61 @@ def _cleanup_failed_run(ctx: aws_common.AwsExecutorContext, state: dict[str, str
 
 def _run_aws(ctx: aws_common.AwsExecutorContext) -> None:
     state = {}
+    provenance_dir = None
+    if (ctx.suite_name == "micro" and
+            ctx.contract.remote.runtime_container_image.startswith("bpf-benchmark/micro-characterization:")):
+        provenance_dir = (ctx.results_dir / "provenance" /
+                          f"{ctx.suite_name}_{ctx.run_token}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}")
+    record = {
+        "run_token": ctx.run_token, "target": ctx.target_name, "suite": ctx.suite_name,
+        "target_arch": ctx.contract.identity.target_arch,
+        "region": ctx.aws_region, "runtime_image": ctx.contract.remote.runtime_container_image,
+        "started_at": datetime.now(timezone.utc).isoformat(), "status": "initializing",
+    }
+    def save_record(**updates) -> None:
+        if provenance_dir is not None:
+            record.update(updates)
+            write_json_object(provenance_dir / "execution.json", record)
+
+    save_record()
+    if provenance_dir is not None:
+        print(f"[aws-executor] Machine provenance: {provenance_dir}", file=sys.stderr)
+    capturing = False
     try:
         instance_ip = _ensure_instance_for_suite(ctx)
         state = aws_common._load_instance_state(ctx)
+        if provenance_dir is not None:
+            capturing = True
+            capture_snapshot(ctx, state, provenance_dir / "before.json")
+            capturing = False
+        save_record(status="running")
         _run_remote_suite(ctx, instance_ip)
+        if provenance_dir is not None:
+            capturing = True
+            capture_snapshot(ctx, state, provenance_dir / "after.json")
+            capturing = False
     except BaseException as exc:
+        if provenance_dir is not None:
+            state = state or aws_common._load_instance_state(ctx)
+        if provenance_dir is not None and state.get("STATE_INSTANCE_ID") and not capturing:
+            try:
+                capture_snapshot(ctx, state, provenance_dir / "failure.json")
+            except BaseException as snapshot_error:
+                record["failure_snapshot_error"] = str(snapshot_error)
+                print(f"[aws-executor][ERROR] Failure snapshot: {snapshot_error}", file=sys.stderr)
+        save_record(status="error", error=str(exc), completed_at=datetime.now(timezone.utc).isoformat())
         cleanup_error = _cleanup_failed_run(ctx, state or None)
+        save_record(cleanup_error=cleanup_error)
         if cleanup_error and hasattr(exc, "add_note"):
             exc.add_note(cleanup_error)
         raise
-    aws_common._terminate_instance(ctx, state.get("STATE_INSTANCE_ID", "").strip())
-    shutil.rmtree(ctx.run_state_dir, ignore_errors=True)
+    try:
+        aws_common._terminate_instance(ctx, state.get("STATE_INSTANCE_ID", "").strip())
+        shutil.rmtree(ctx.run_state_dir, ignore_errors=True)
+    except BaseException as exc:
+        save_record(status="cleanup_error", error=str(exc), completed_at=datetime.now(timezone.utc).isoformat())
+        raise
+    save_record(status="completed", completed_at=datetime.now(timezone.utc).isoformat())
 
 
 def main(argv: list[str] | None = None) -> None:
