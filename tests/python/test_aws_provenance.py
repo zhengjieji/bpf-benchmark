@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +17,7 @@ from runner.libs import aws_common, aws_executor, aws_provenance
 from runner.libs.run_contract import (
     ArtifactRequirements, AwsConfig, KvmConfig, RemoteConfig, RunConfig, RunIdentity, SuiteRequirements,
 )
+from runner.suites import micro as micro_suite
 
 
 class AwsProvenanceTests(unittest.TestCase):
@@ -186,6 +188,42 @@ class AwsProvenanceTests(unittest.TestCase):
         self.assertEqual(provenance["execution"], {"run_token": "test-token", "executor": "aws",
                                                    "target": "aws-x86", "target_arch": "x86_64"})
         self.assertEqual(provenance["kernel_config"]["sha256"], hashlib.sha256(config.read_bytes()).hexdigest())
+
+    def test_micro_suite_preserves_execution_identity_in_real_driver_child(self) -> None:
+        # A child process must see the parsed identity after the suite filters
+        # its environment; testing collect_provenance alone misses that boundary.
+        micro_dir = self.root / "micro"
+        micro_dir.mkdir()
+        (micro_dir / "driver.py").write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "names = ('RUN_TOKEN', 'RUN_EXECUTOR', 'RUN_TARGET_NAME', 'RUN_TARGET_ARCH')\n"
+            "output = Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.write_text(json.dumps({name: os.environ.get(name) for name in names}))\n"
+        )
+        for arch, normalized_arch, vendor_arch in (("x86", "x86_64", "x86"),
+                                                  ("aarch64", "arm64", "arm64")):
+            with self.subTest(arch=arch):
+                output = self.root / f"{arch}-child-env.json"
+                runner = self.root / f"{arch}-micro-exec"
+                runner.write_text("#!/bin/sh\nexit 0\n")
+                runner.chmod(0o755)
+                (micro_dir / "programs" / f"build-{vendor_arch}").mkdir(parents=True)
+                env = {
+                    "WORKSPACE": str(self.root), "RUN_TOKEN": f"token-{arch}",
+                    "RUN_EXECUTOR": "aws", "RUN_TARGET_NAME": f"aws-{arch}",
+                    "RUN_TARGET_ARCH": arch, "RUN_REMOTE_PYTHON_BIN": sys.executable,
+                    "RUN_BPFTOOL_BIN": sys.executable, "MICRO_RUNNER_BINARY": str(runner),
+                    "MICRO_OUTPUT": str(output), "RUNTIMES": "native",
+                    "BPFREJIT_MICRO_IMAGE_PROFILE": "characterization",
+                    "TMPDIR": str(self.root / "tmp"),
+                }
+                with mock.patch.dict(os.environ, env, clear=True):
+                    micro_suite.main([])
+                self.assertEqual(json.loads(output.read_text()), {
+                    "RUN_TOKEN": f"token-{arch}", "RUN_EXECUTOR": "aws",
+                    "RUN_TARGET_NAME": f"aws-{arch}", "RUN_TARGET_ARCH": normalized_arch,
+                })
 
 
 if __name__ == "__main__":

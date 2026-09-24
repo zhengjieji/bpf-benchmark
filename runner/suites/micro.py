@@ -75,6 +75,12 @@ def _selected_runtimes(args: argparse.Namespace) -> list[str]:
 
 def _runtime_env(workspace: Path, args: argparse.Namespace) -> dict[str, str]:
     env = base_runtime_env()
+    env.update({
+        "RUN_TOKEN": args.run_token,
+        "RUN_EXECUTOR": args.executor,
+        "RUN_TARGET_NAME": args.target_name,
+        "RUN_TARGET_ARCH": args.target_arch,
+    })
     setup_tmpdir(env, args.run_token or f"{args.target_name}_micro")
     env["PATH"] = runtime_path_value(workspace, args.target_arch)
     if runtime_ld := cross_runtime_ld_library_path(workspace, args.target_arch):
