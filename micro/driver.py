@@ -8,6 +8,7 @@ import os
 import platform
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -695,6 +696,13 @@ def main(argv: list[str] | None = None) -> int:
                 "rounds": [],
                 "runs": [],
             }
+            if memory_file is not None:
+                archived_input = artifact_dir / "details" / "inputs" / f"{sanitize_artifact_token(benchmark.name)}.mem"
+                archived_input.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(memory_file, archived_input)
+                input_identity = file_identity(archived_input)
+                input_identity["path"] = str(archived_input.relative_to(artifact_dir))
+                benchmark_record["input_archive"] = input_identity
 
             current_benchmark_name = benchmark.name
             current_benchmark_index = bench_idx + 1

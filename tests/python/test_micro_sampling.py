@@ -150,12 +150,15 @@ class MicroSamplingTests(unittest.TestCase):
             executable = root / "micro_exec"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json, sys\n"
+                "import hashlib, json, sys\n"
+                "from pathlib import Path\n"
                 "if '--help' in sys.argv:\n"
                 "    print('run-llvmbpf'); raise SystemExit(0)\n"
                 "warmup = int(sys.argv[sys.argv.index('--warmup') + 1])\n"
                 "repeat = int(sys.argv[sys.argv.index('--inner-repeat') + 1])\n"
+                "memory = Path(sys.argv[sys.argv.index('--memory') + 1]).read_bytes()\n"
                 "print(json.dumps({'result': 42, 'retval': 0, 'exec_ns': 11, 'repeat': repeat, "
+                "'input_sha256': hashlib.sha256(memory).hexdigest(), "
                 "'measured_iterations': repeat, 'warmup_batches': warmup, "
                 "'warmup_iterations': warmup * repeat, 'timing_source': 'fixture'}))\n"
             )
@@ -164,6 +167,9 @@ class MicroSamplingTests(unittest.TestCase):
             object_path.write_bytes(b"fixture")
             manifest_path = root / "suite.yaml"
             manifest_path.write_text("fixture: true\n")
+            memory_file = root / "generated.mem"
+            memory_bytes = bytes(range(256)) + b"\x00\xff\nfixture input\x00"
+            memory_file.write_bytes(memory_bytes)
             target = CatalogTarget("fixture", object_path, native_object_path=object_path,
                                    native_kernel_object_path=object_path,
                                    proof_object_path=object_path, proof_compile_metadata_path=object_path,
@@ -174,14 +180,21 @@ class MicroSamplingTests(unittest.TestCase):
                 (target,),
             )
             with mock.patch.object(driver, "load_suite", return_value=suite), \
-                    mock.patch.object(driver, "resolve_memory_file", return_value=None), \
+                    mock.patch.object(driver, "resolve_memory_file", return_value=memory_file), \
                     mock.patch.object(driver, "read_required_text", return_value="fixture"), \
                     mock.patch.object(driver, "validate_publication_environment"), \
                     mock.patch.object(driver, "write_code_compare_markdown"):
                 status = driver.main(["--warmup-repeat", "2", "--shuffle-seed", "7"])
             self.assertEqual(status, 0)
-            payload = json.loads(next(root.glob("result_*/details/result.json")).read_text())
+            result_file = next(root.glob("result_*/details/result.json"))
+            payload = json.loads(result_file.read_text())
             benchmark = payload["benchmarks"][0]
+            archived = benchmark["input_archive"]
+            self.assertEqual(archived["path"], "details/inputs/fixture.mem")
+            self.assertEqual((result_file.parent.parent / archived["path"]).read_bytes(), memory_bytes)
+            self.assertEqual(archived["sha256"], hashlib.sha256(memory_bytes).hexdigest())
+            self.assertEqual(archived["sha256"], benchmark["files"]["input"]["sha256"])
+            self.assertEqual(archived["size_bytes"], len(memory_bytes))
             self.assertEqual(len(benchmark["warmup_runs"]), 4)
             self.assertEqual(len(benchmark["rounds"]), 3)
             for round_record in benchmark["rounds"]:
@@ -190,6 +203,7 @@ class MicroSamplingTests(unittest.TestCase):
             for run in benchmark["runs"]:
                 self.assertEqual([sample["sample_index"] for sample in run["samples"]], [0, 1, 2])
                 for sample in run["samples"]:
+                    self.assertEqual(sample["input_sha256"], archived["sha256"])
                     round_record = benchmark["rounds"][sample["round_index"]]
                     self.assertEqual(round_record["runtime_order"][sample["runtime_order_index"]], run["runtime"])
                     self.assertEqual(sample["warmup_iterations"], 194)
@@ -200,14 +214,17 @@ class MicroSamplingTests(unittest.TestCase):
 
             bad_suite = replace(suite, targets=(replace(target, expected_result=43),))
             with mock.patch.object(driver, "load_suite", return_value=bad_suite), \
-                    mock.patch.object(driver, "resolve_memory_file", return_value=None), \
+                    mock.patch.object(driver, "resolve_memory_file", return_value=memory_file), \
                     mock.patch.object(driver, "read_required_text", return_value="fixture"), \
                     mock.patch.object(driver, "validate_publication_environment"), \
                     mock.patch.object(driver, "write_code_compare_markdown"):
                 status = driver.main(["--warmup-repeat", "0", "--warmups", "0",
                                       "--output", str(root / "failed.json")])
             self.assertEqual(status, 1)
-            failed = json.loads(next(root.glob("failed_*/details/result.json")).read_text())["benchmarks"][0]
+            failed_file = next(root.glob("failed_*/details/result.json"))
+            failed = json.loads(failed_file.read_text())["benchmarks"][0]
+            self.assertEqual((failed_file.parent.parent / failed["input_archive"]["path"]).read_bytes(), memory_bytes)
+            self.assertEqual(failed["input_archive"]["sha256"], archived["sha256"])
             self.assertEqual(failed["rounds"][0]["status"], "error")
             self.assertEqual(len(failed["runs"]), 1)
             self.assertEqual(failed["runs"][0]["samples"][0]["result"], 42)
