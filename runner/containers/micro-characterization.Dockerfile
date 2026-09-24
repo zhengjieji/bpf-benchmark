@@ -45,6 +45,8 @@ COPY micro/config ./micro/config
 COPY --link --from=micro-source /*.bpf.c ./micro/programs/
 COPY --link --from=micro-source /*.h ./micro/programs/
 COPY --link --from=micro-host-kernel-config /source-manifest.json /artifacts/source-manifest.json
+COPY --link --from=micro-host-kernel-config /host-packages.tsv /artifacts/host-packages.tsv
+COPY --link --from=micro-host-kernel-config /target-packages.tsv /artifacts/target-packages.tsv
 RUN install -d micro/results micro/generated-inputs /var/tmp/bpfrejit-runtime
 
 ENV BPFREJIT_IMAGE_WORKSPACE=${IMAGE_WORKSPACE} \

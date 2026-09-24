@@ -37,6 +37,10 @@ NATIVE_KOP_LLVM_TBLGEN := $(NATIVE_KOP_LLVM_BUILD_DIR)/bin/llvm-tblgen
 NATIVE_KOP_LLVM_DIR := $(NATIVE_KOP_LLVM_BUILD_DIR)/lib/cmake/llvm
 ARM64_KOP_LLVM_BUILD_DIR := $(ROOT_DIR)/llvm-backend/build-bpf-kop-arm64
 ARM64_RUNNER_LLVM_DIR := $(ROOT_DIR)/llvm-backend/build-bpf-kop-arm64/lib/cmake/llvm
+ARM64_CHARACTERIZATION_LLVM_VERSION := $(shell dpkg-query -W -f='$${Version}' llvm-18-dev 2>/dev/null)
+ARM64_CHARACTERIZATION_SYSROOT := $(ROOT_DIR)/.cache/sysroots/arm64-llvm18-$(subst :,_,$(ARM64_CHARACTERIZATION_LLVM_VERSION))
+ARM64_CHARACTERIZATION_LLVM_PACKAGES := llvm-18-dev llvm-18 llvm-18-runtime llvm-18-tools llvm-18-linker-tools libllvm18 libclang-cpp18 libpolly-18-dev
+ARM64_CHARACTERIZATION_PACKAGE_MANIFEST := $(ARM64_CHARACTERIZATION_SYSROOT)/packages.tsv
 ARM64_PKG_CONFIG_LIBDIR = $(AARCH64_SYSROOT_DIR)/usr/lib/aarch64-linux-gnu/pkgconfig
 ARM64_PKG_CONFIG = PKG_CONFIG_LIBDIR="$(ARM64_PKG_CONFIG_LIBDIR)" PKG_CONFIG_SYSROOT_DIR="$(AARCH64_SYSROOT_DIR)"
 ARM64_SYS_INCLUDE_FLAGS = -I/usr/aarch64-linux-gnu/include -I$(AARCH64_SYSROOT_DIR)/usr/include -I$(AARCH64_SYSROOT_DIR)/usr/include/aarch64-linux-gnu
@@ -212,6 +216,26 @@ $(AARCH64_SYSROOT_DIR)/usr/include/libelf.h $(AARCH64_SYSROOT_DIR)/usr/include/y
 	cd "$(AARCH64_SYSROOT_DIR)/.debs" && apt-get download $(AARCH64_SYSROOT_DEB_PACKAGES); \
 	for d in "$(AARCH64_SYSROOT_DIR)"/.debs/*.deb; do dpkg-deb -x "$$d" "$(AARCH64_SYSROOT_DIR)"; done
 
+.PHONY: arm64-characterization-llvm18-sysroot
+arm64-characterization-llvm18-sysroot: $(ARM64_CHARACTERIZATION_PACKAGE_MANIFEST)
+
+$(ARM64_CHARACTERIZATION_PACKAGE_MANIFEST): $(RUNNER_DIR)/mk/build.mk
+	test -n "$(ARM64_CHARACTERIZATION_LLVM_VERSION)" || { echo 'Install host llvm-18-dev before building the ARM characterization runner' >&2; exit 1; }
+	install -d "$(ARM64_CHARACTERIZATION_SYSROOT)/.debs/partial"
+	apt-get -o Debug::NoLocking=1 -o Dir::State::status=/dev/null \
+		-o Dir::Cache::archives="$(ARM64_CHARACTERIZATION_SYSROOT)/.debs" \
+		-o APT::Architecture=arm64 -o APT::Architectures::=arm64 \
+		--download-only --no-install-recommends --no-remove -y install \
+		$(foreach pkg,$(ARM64_CHARACTERIZATION_LLVM_PACKAGES),$(pkg):arm64=$(ARM64_CHARACTERIZATION_LLVM_VERSION)) \
+		$(AARCH64_SYSROOT_DEB_PACKAGES) libedit-dev:arm64 libcurl4-openssl-dev:arm64
+	: > "$@.tmp"
+	for d in "$(ARM64_CHARACTERIZATION_SYSROOT)"/.debs/*.deb; do \
+		dpkg-deb -x "$$d" "$(ARM64_CHARACTERIZATION_SYSROOT)"; \
+		dpkg-deb --show --showformat='$${Package}\t$${Version}\t$${Architecture}\n' "$$d" >> "$@.tmp"; \
+	done
+	LC_ALL=C sort -u "$@.tmp" > "$@"
+	rm -f "$@.tmp"
+
 host-rust-arm64: aarch64-sysroot
 	$(ARM64_CARGO_ENV) cargo build --release --workspace --target "$(ARM64_RUST_TARGET)" --target-dir "$(ROOT_DIR)/bpfopt/target" --manifest-path "$(ROOT_DIR)/bpfopt/Cargo.toml" -p kopprober
 	$(ARM64_CARGO_ENV) cargo build --release --target "$(ARM64_RUST_TARGET)" --manifest-path "$(NATIVE_LINK_DIR)/Cargo.toml"
@@ -276,10 +300,21 @@ host-runner-arm64: RUNNER_LLVM_DIR_ARCH := $(ARM64_RUNNER_LLVM_DIR)
 host-runner-arm64: RUNNER_KERNEL_OFFSETS_INCLUDE := $(MICRO_PROGRAM_BUILD_ARM64)
 host-runner-arm64: RUNNER_CMAKE_CROSS := -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_FIND_ROOT_PATH="$(AARCH64_SYSROOT_DIR);$(ARM64_RUNNER_LLVM_SYSROOT);/usr/aarch64-linux-gnu" -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH -DCMAKE_EXE_LINKER_FLAGS="-L$(AARCH64_SYSROOT_DIR)/usr/lib/aarch64-linux-gnu -L$(ARM64_RUNNER_LLVM_SYSROOT)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(AARCH64_SYSROOT_DIR)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(ARM64_RUNNER_LLVM_SYSROOT)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(ARM64_RUNNER_LLVM_SYSROOT)/usr/lib/llvm-15/lib"
 host-runner-arm64: RUNNER_PKG_CONFIG := PKG_CONFIG_LIBDIR="$(ARM64_PKG_CONFIG_LIBDIR)" PKG_CONFIG_SYSROOT_DIR="$(AARCH64_SYSROOT_DIR)"
+host-runner-arm64-llvm18: RUNNER_BUILD_DIR_ARCH := $(RUNNER_DIR)/build-arm64-llvm18-characterization
+host-runner-arm64-llvm18: RUNNER_CC := aarch64-linux-gnu-gcc
+host-runner-arm64-llvm18: RUNNER_CXX := aarch64-linux-gnu-g++
+host-runner-arm64-llvm18: RUNNER_LIBBPF_ENV := CC=aarch64-linux-gnu-gcc LD=aarch64-linux-gnu-ld AR=aarch64-linux-gnu-ar
+host-runner-arm64-llvm18: RUNNER_STRIP := aarch64-linux-gnu-strip
+host-runner-arm64-llvm18: RUNNER_LLVM_DIR_ARCH := $(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib/cmake/llvm
+host-runner-arm64-llvm18: RUNNER_KERNEL_OFFSETS_INCLUDE := $(MICRO_PROGRAM_BUILD_ARM64)
+host-runner-arm64-llvm18: RUNNER_PKG_CONFIG := PKG_CONFIG_LIBDIR="$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu/pkgconfig" PKG_CONFIG_SYSROOT_DIR="$(ARM64_CHARACTERIZATION_SYSROOT)"
+host-runner-arm64-llvm18: RUNNER_CMAKE_CROSS := -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_FIND_ROOT_PATH="$(ARM64_CHARACTERIZATION_SYSROOT);/usr/aarch64-linux-gnu" -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY -DCMAKE_EXE_LINKER_FLAGS="-L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib"
 host-runner-x86: host-micro-programs-x86
 host-runner-docker-x86: host-micro-programs-docker-x86
 host-runner-arm64: aarch64-sysroot host-llvm-arm64 host-micro-programs-arm64
-host-runner-x86 host-runner-arm64 host-runner-docker-x86:
+.PHONY: host-runner-arm64-llvm18
+host-runner-arm64-llvm18: arm64-characterization-llvm18-sysroot host-micro-programs-arm64
+host-runner-x86 host-runner-arm64 host-runner-docker-x86 host-runner-arm64-llvm18:
 	$(MAKE) -C "$(ROOT_DIR)/vendor/libbpf/src" -j"$(JOBS)" BUILD_STATIC_ONLY=1 $(RUNNER_LIBBPF_ENV) CFLAGS="$(RUNNER_LIBBPF_CFLAGS)" OBJDIR="$(RUNNER_BUILD_DIR_ARCH)/$(RUNNER_LIBBPF_OBJ_SUBDIR)" DESTDIR= PREFIX="$(RUNNER_BUILD_DIR_ARCH)/vendor/libbpf/prefix" "$(RUNNER_BUILD_DIR_ARCH)/$(RUNNER_LIBBPF_OBJ_SUBDIR)/libbpf.a" install_headers
 	$(RUNNER_PKG_CONFIG) cmake -S "$(RUNNER_DIR)" -B "$(RUNNER_BUILD_DIR_ARCH)" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$(RUNNER_CC)" -DCMAKE_CXX_COMPILER="$(RUNNER_CXX)" -DMICRO_REPO_ROOT="$(ROOT_DIR)" -DMICRO_LIBBPF_PREFIX="$(RUNNER_BUILD_DIR_ARCH)/vendor/libbpf/prefix" -DMICRO_LIBBPF_LIBRARY="$(RUNNER_BUILD_DIR_ARCH)/$(RUNNER_LIBBPF_OBJ_SUBDIR)/libbpf.a" -DMICRO_KERNEL_OFFSETS_INCLUDE="$(RUNNER_KERNEL_OFFSETS_INCLUDE)" -DMICRO_EXEC_ENABLE_LLVMBPF=1 -DLLVM_DIR="$(RUNNER_LLVM_DIR_ARCH)" $(RUNNER_CMAKE_CROSS)
 	cmake --build "$(RUNNER_BUILD_DIR_ARCH)" --target micro_exec native_loader_shared -j"$(JOBS)"
@@ -435,22 +470,26 @@ x86-micro-characterization-image-tar: MICRO_PROFILE_PLATFORM := linux/amd64
 x86-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_IMAGE := bzImage
 x86-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BOOT := arch/x86/boot
 x86-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_DIR := build-llvmbpf
+x86-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_BUILD := build-llvmbpf
 x86-micro-characterization-image-tar: MICRO_PROFILE_OBJDUMP := objdump
 x86-micro-characterization-image-tar: MICRO_PROFILE_NATIVE_LINK_DIR := $(NATIVE_LINK_DIR)/target/release
 x86-micro-characterization-image-tar: MICRO_PROFILE_IMAGE := $(X86_MICRO_CHARACTERIZATION_IMAGE)
 x86-micro-characterization-image-tar: MICRO_PROFILE_IMAGE_TAR := $(X86_MICRO_CHARACTERIZATION_IMAGE_TAR)
+x86-micro-characterization-image-tar: MICRO_PROFILE_PACKAGES = $(MICRO_PROFILE_CONFIG)/host-packages.tsv
 
-arm64-micro-characterization-image-tar: host-kernel-arm64 host-kop-arm64 host-native-link-arm64 host-bpftool-arm64 host-runner-arm64 host-micro-programs-arm64 host-arm64-sim-proofs
+arm64-micro-characterization-image-tar: host-kernel-arm64 host-kop-arm64 host-native-link-arm64 host-bpftool-arm64 host-runner-arm64-llvm18 host-micro-programs-arm64 host-arm64-sim-proofs
 arm64-micro-characterization-image-tar: MICRO_PROFILE_ARCH := arm64
 arm64-micro-characterization-image-tar: MICRO_PROFILE_VENDOR_ARCH := arm64
 arm64-micro-characterization-image-tar: MICRO_PROFILE_PLATFORM := linux/arm64
 arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_IMAGE := vmlinuz.efi
 arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BOOT := arch/arm64/boot
 arm64-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_DIR := build-arm64-llvmbpf
+arm64-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_BUILD := build-arm64-llvm18-characterization
 arm64-micro-characterization-image-tar: MICRO_PROFILE_OBJDUMP := aarch64-linux-gnu-objdump
 arm64-micro-characterization-image-tar: MICRO_PROFILE_NATIVE_LINK_DIR := $(NATIVE_LINK_DIR)/target/$(ARM64_RUST_TARGET)/release
 arm64-micro-characterization-image-tar: MICRO_PROFILE_IMAGE := $(ARM64_MICRO_CHARACTERIZATION_IMAGE)
 arm64-micro-characterization-image-tar: MICRO_PROFILE_IMAGE_TAR := $(ARM64_MICRO_CHARACTERIZATION_IMAGE_TAR)
+arm64-micro-characterization-image-tar: MICRO_PROFILE_PACKAGES := $(ARM64_CHARACTERIZATION_PACKAGE_MANIFEST)
 
 x86-micro-characterization-image-tar arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BUILD = $(VENDOR_BUILD_DIR)/$(MICRO_PROFILE_VENDOR_ARCH)/linux
 x86-micro-characterization-image-tar arm64-micro-characterization-image-tar: MICRO_PROFILE_CONFIG = $(MICRO_PROFILE_KERNEL_BUILD)/bpf-benchmark-kernel-config-context
@@ -462,12 +501,14 @@ x86-micro-characterization-image-tar arm64-micro-characterization-image-tar:
 		test -n "$${kernel_release}"; \
 		printf '{"kernel_release":"%s","target_arch":"%s","kernel_image":"%s"}\n' "$${kernel_release}" "$(MICRO_PROFILE_ARCH)" "$(MICRO_PROFILE_KERNEL_IMAGE)" > "$(MICRO_PROFILE_CONFIG)/manifest.json"
 	"$(PYTHON)" -m runner.libs.build_source_manifest --arch "$(MICRO_PROFILE_ARCH)" --output "$(MICRO_PROFILE_CONFIG)/source-manifest.json"
+	dpkg-query -W -f='$${Package}\t$${Version}\t$${Architecture}\n' clang-18 llvm-18 llvm-18-dev > "$(MICRO_PROFILE_CONFIG)/host-packages.tsv"
+	cp "$(MICRO_PROFILE_PACKAGES)" "$(MICRO_PROFILE_CONFIG)/target-packages.tsv"
 	"$(PYTHON)" -m runner.libs.stage_micro_proofs --manifest "$(MICRO_PROOF_CONFIG)" \
 		--programs "$(MICRO_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)" \
 		--proofs "$(ROOT_DIR)/native-sim/$(MICRO_PROFILE_VENDOR_ARCH)/micro-prog/build/native-link" \
 		--output "$(MICRO_PROFILE_PROOFS)" --objdump "$(MICRO_PROFILE_OBJDUMP)"
 	docker build --platform "$(MICRO_PROFILE_PLATFORM)" \
-		--build-context micro-host-runner="$(RUNNER_DIR)/$(MICRO_PROFILE_RUNNER_DIR)" \
+		--build-context micro-host-runner="$(RUNNER_DIR)/$(MICRO_PROFILE_RUNNER_BUILD)" \
 		--build-context micro-host-programs="$(MICRO_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)" \
 		--build-context micro-host-proofs="$(STAGE2_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)/$(MICRO_PROFILE_VENDOR_ARCH)_sim_proofs" \
 		--build-context micro-host-native-proofs="$(MICRO_PROFILE_PROOFS)" \
