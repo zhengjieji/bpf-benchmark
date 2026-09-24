@@ -233,6 +233,8 @@ $(ARM64_CHARACTERIZATION_PACKAGE_MANIFEST): $(RUNNER_DIR)/mk/build.mk
 		dpkg-deb -x "$$d" "$(ARM64_CHARACTERIZATION_SYSROOT)"; \
 		dpkg-deb --show --showformat='$${Package}\t$${Version}\t$${Architecture}\n' "$$d" >> "$@.tmp"; \
 	done
+	# Ubuntu's merged-/usr layout is not established by dpkg-deb extraction.
+	ln -sfnT usr/lib "$(ARM64_CHARACTERIZATION_SYSROOT)/lib"
 	LC_ALL=C sort -u "$@.tmp" > "$@"
 	rm -f "$@.tmp"
 
@@ -308,7 +310,7 @@ host-runner-arm64-llvm18: RUNNER_STRIP := aarch64-linux-gnu-strip
 host-runner-arm64-llvm18: RUNNER_LLVM_DIR_ARCH := $(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib/cmake/llvm
 host-runner-arm64-llvm18: RUNNER_KERNEL_OFFSETS_INCLUDE := $(MICRO_PROGRAM_BUILD_ARM64)
 host-runner-arm64-llvm18: RUNNER_PKG_CONFIG := PKG_CONFIG_LIBDIR="$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu/pkgconfig" PKG_CONFIG_SYSROOT_DIR="$(ARM64_CHARACTERIZATION_SYSROOT)"
-host-runner-arm64-llvm18: RUNNER_CMAKE_CROSS := -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_FIND_ROOT_PATH="$(ARM64_CHARACTERIZATION_SYSROOT);/usr/aarch64-linux-gnu" -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY -DCMAKE_EXE_LINKER_FLAGS="-L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib"
+host-runner-arm64-llvm18: RUNNER_CMAKE_CROSS := -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_SYSROOT="$(ARM64_CHARACTERIZATION_SYSROOT)" -DCMAKE_FIND_ROOT_PATH="$(ARM64_CHARACTERIZATION_SYSROOT);/usr/aarch64-linux-gnu" -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY -DCMAKE_EXE_LINKER_FLAGS="-L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -L$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(ARM64_CHARACTERIZATION_SYSROOT)/usr/lib/llvm-18/lib"
 host-runner-x86: host-micro-programs-x86
 host-runner-docker-x86: host-micro-programs-docker-x86
 host-runner-arm64: aarch64-sysroot host-llvm-arm64 host-micro-programs-arm64
