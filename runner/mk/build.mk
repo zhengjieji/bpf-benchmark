@@ -69,6 +69,11 @@ ARM64_RUNNER_RUNTIME_IMAGE := bpf-benchmark/runner-runtime:arm64
 
 X86_RUNNER_RUNTIME_IMAGE_TAR := $(CONTAINER_IMAGE_ARTIFACT_ROOT)/x86_64-runner-runtime.image.tar
 ARM64_RUNNER_RUNTIME_IMAGE_TAR := $(CONTAINER_IMAGE_ARTIFACT_ROOT)/arm64-runner-runtime.image.tar
+X86_MICRO_CHARACTERIZATION_IMAGE := bpf-benchmark/micro-characterization:x86_64
+ARM64_MICRO_CHARACTERIZATION_IMAGE := bpf-benchmark/micro-characterization:arm64
+X86_MICRO_CHARACTERIZATION_IMAGE_TAR := $(CONTAINER_IMAGE_ARTIFACT_ROOT)/x86_64-micro-characterization.image.tar
+ARM64_MICRO_CHARACTERIZATION_IMAGE_TAR := $(CONTAINER_IMAGE_ARTIFACT_ROOT)/arm64-micro-characterization.image.tar
+MICRO_CHARACTERIZATION_CONTAINERFILE := $(RUNNER_CONTAINER_DIR)/micro-characterization.Dockerfile
 
 X86_RUNTIME_KERNEL_IMAGE := $(VENDOR_BUILD_DIR)/x86/linux/arch/x86/boot/bzImage
 HOST_GO ?= $(or $(GO),go)
@@ -171,6 +176,16 @@ host-kop-arm64: host-kernel-arm64
 
 host-native-link:
 	cargo build --release --manifest-path "$(NATIVE_LINK_DIR)/Cargo.toml"
+
+.PHONY: host-native-link-arm64 host-bpftool-x86 host-bpftool-arm64
+host-native-link-arm64: aarch64-sysroot
+	$(ARM64_CARGO_ENV) cargo build --release --target "$(ARM64_RUST_TARGET)" --manifest-path "$(NATIVE_LINK_DIR)/Cargo.toml"
+
+host-bpftool-x86:
+	$(MAKE) -C "$(ROOT_DIR)/vendor" bpftool-x86 JOBS="$(JOBS)"
+
+host-bpftool-arm64: aarch64-sysroot
+	$(MAKE) -C "$(ROOT_DIR)/vendor" bpftool-arm64 JOBS="$(JOBS)"
 
 host-rust-x86: host-native-link
 	cargo build --release --workspace --target-dir "$(ROOT_DIR)/bpfopt/target" --manifest-path "$(ROOT_DIR)/bpfopt/Cargo.toml" -p kopprober
@@ -411,6 +426,66 @@ arm64-runner-runtime-image-tar: host-kernel-arm64 host-kop-arm64 host-rust-arm64
 		-t "$(ARM64_RUNNER_RUNTIME_IMAGE)" -f "$(RUNNER_RUNTIME_CONTAINERFILE)" "$(ROOT_DIR)"
 	docker save -o "$(ARM64_RUNNER_RUNTIME_IMAGE_TAR).tmp" "$(ARM64_RUNNER_RUNTIME_IMAGE)"
 	mv -f "$(ARM64_RUNNER_RUNTIME_IMAGE_TAR).tmp" "$(ARM64_RUNNER_RUNTIME_IMAGE_TAR)"
+
+.PHONY: x86-micro-characterization-image-tar arm64-micro-characterization-image-tar
+x86-micro-characterization-image-tar: host-kernel-x86 host-kop-x86 host-native-link host-bpftool-x86 host-runner-x86 host-micro-programs-x86 host-x86-sim-proofs
+x86-micro-characterization-image-tar: MICRO_PROFILE_ARCH := x86_64
+x86-micro-characterization-image-tar: MICRO_PROFILE_VENDOR_ARCH := x86
+x86-micro-characterization-image-tar: MICRO_PROFILE_PLATFORM := linux/amd64
+x86-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_IMAGE := bzImage
+x86-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BOOT := arch/x86/boot
+x86-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_DIR := build-llvmbpf
+x86-micro-characterization-image-tar: MICRO_PROFILE_OBJDUMP := objdump
+x86-micro-characterization-image-tar: MICRO_PROFILE_NATIVE_LINK_DIR := $(NATIVE_LINK_DIR)/target/release
+x86-micro-characterization-image-tar: MICRO_PROFILE_IMAGE := $(X86_MICRO_CHARACTERIZATION_IMAGE)
+x86-micro-characterization-image-tar: MICRO_PROFILE_IMAGE_TAR := $(X86_MICRO_CHARACTERIZATION_IMAGE_TAR)
+
+arm64-micro-characterization-image-tar: host-kernel-arm64 host-kop-arm64 host-native-link-arm64 host-bpftool-arm64 host-runner-arm64 host-micro-programs-arm64 host-arm64-sim-proofs
+arm64-micro-characterization-image-tar: MICRO_PROFILE_ARCH := arm64
+arm64-micro-characterization-image-tar: MICRO_PROFILE_VENDOR_ARCH := arm64
+arm64-micro-characterization-image-tar: MICRO_PROFILE_PLATFORM := linux/arm64
+arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_IMAGE := vmlinuz.efi
+arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BOOT := arch/arm64/boot
+arm64-micro-characterization-image-tar: MICRO_PROFILE_RUNNER_DIR := build-arm64-llvmbpf
+arm64-micro-characterization-image-tar: MICRO_PROFILE_OBJDUMP := aarch64-linux-gnu-objdump
+arm64-micro-characterization-image-tar: MICRO_PROFILE_NATIVE_LINK_DIR := $(NATIVE_LINK_DIR)/target/$(ARM64_RUST_TARGET)/release
+arm64-micro-characterization-image-tar: MICRO_PROFILE_IMAGE := $(ARM64_MICRO_CHARACTERIZATION_IMAGE)
+arm64-micro-characterization-image-tar: MICRO_PROFILE_IMAGE_TAR := $(ARM64_MICRO_CHARACTERIZATION_IMAGE_TAR)
+
+x86-micro-characterization-image-tar arm64-micro-characterization-image-tar: MICRO_PROFILE_KERNEL_BUILD = $(VENDOR_BUILD_DIR)/$(MICRO_PROFILE_VENDOR_ARCH)/linux
+x86-micro-characterization-image-tar arm64-micro-characterization-image-tar: MICRO_PROFILE_CONFIG = $(MICRO_PROFILE_KERNEL_BUILD)/bpf-benchmark-kernel-config-context
+x86-micro-characterization-image-tar arm64-micro-characterization-image-tar: MICRO_PROFILE_PROOFS = $(CONTAINER_IMAGE_ARTIFACT_ROOT)/micro-characterization-$(MICRO_PROFILE_ARCH)-proofs
+x86-micro-characterization-image-tar arm64-micro-characterization-image-tar:
+	install -d "$(CONTAINER_IMAGE_ARTIFACT_ROOT)" "$(MICRO_PROFILE_CONFIG)"
+	cp "$(MICRO_PROFILE_KERNEL_BUILD)/.config" "$(MICRO_PROFILE_CONFIG)/config"
+	kernel_release="$$(cat "$(MICRO_PROFILE_KERNEL_BUILD)/include/config/kernel.release")"; \
+		test -n "$${kernel_release}"; \
+		printf '{"kernel_release":"%s","target_arch":"%s","kernel_image":"%s"}\n' "$${kernel_release}" "$(MICRO_PROFILE_ARCH)" "$(MICRO_PROFILE_KERNEL_IMAGE)" > "$(MICRO_PROFILE_CONFIG)/manifest.json"
+	"$(PYTHON)" -m runner.libs.build_source_manifest --arch "$(MICRO_PROFILE_ARCH)" --output "$(MICRO_PROFILE_CONFIG)/source-manifest.json"
+	"$(PYTHON)" -m runner.libs.stage_micro_proofs --manifest "$(MICRO_PROOF_CONFIG)" \
+		--programs "$(MICRO_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)" \
+		--proofs "$(ROOT_DIR)/native-sim/$(MICRO_PROFILE_VENDOR_ARCH)/micro-prog/build/native-link" \
+		--output "$(MICRO_PROFILE_PROOFS)" --objdump "$(MICRO_PROFILE_OBJDUMP)"
+	docker build --platform "$(MICRO_PROFILE_PLATFORM)" \
+		--build-context micro-host-runner="$(RUNNER_DIR)/$(MICRO_PROFILE_RUNNER_DIR)" \
+		--build-context micro-host-programs="$(MICRO_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)" \
+		--build-context micro-host-proofs="$(STAGE2_PROGRAM_DIR)/build-$(MICRO_PROFILE_VENDOR_ARCH)/$(MICRO_PROFILE_VENDOR_ARCH)_sim_proofs" \
+		--build-context micro-host-native-proofs="$(MICRO_PROFILE_PROOFS)" \
+		--build-context micro-host-kernel-image="$(MICRO_PROFILE_KERNEL_BUILD)/$(MICRO_PROFILE_KERNEL_BOOT)" \
+		--build-context micro-host-kernel-config="$(MICRO_PROFILE_CONFIG)" \
+		--build-context micro-host-kernel-modules="$(MICRO_PROFILE_KERNEL_BUILD)/modules-install/lib/modules" \
+		--build-context micro-host-kop="$(ROOT_DIR)/module/$(MICRO_PROFILE_VENDOR_ARCH)/build" \
+		--build-context micro-host-native-link="$(MICRO_PROFILE_NATIVE_LINK_DIR)" \
+		--build-context micro-host-bpftool="$(VENDOR_BUILD_DIR)/$(MICRO_PROFILE_VENDOR_ARCH)/bpftool/bin" \
+		--build-context micro-source="$(MICRO_PROGRAM_DIR)" \
+		--build-arg IMAGE_WORKSPACE="$(ROOT_DIR)" \
+		--build-arg RUN_TARGET_ARCH="$(MICRO_PROFILE_ARCH)" \
+		--build-arg RUNNER_BUILD_DIR_NAME="$(MICRO_PROFILE_RUNNER_DIR)" \
+		--build-arg KERNEL_IMAGE_NAME="$(MICRO_PROFILE_KERNEL_IMAGE)" \
+		--build-arg SIM_PROOF_DIR_NAME="$(MICRO_PROFILE_VENDOR_ARCH)_sim_proofs" \
+		-t "$(MICRO_PROFILE_IMAGE)" -f "$(MICRO_CHARACTERIZATION_CONTAINERFILE)" "$(ROOT_DIR)"
+	docker save -o "$(MICRO_PROFILE_IMAGE_TAR).tmp" "$(MICRO_PROFILE_IMAGE)"
+	mv -f "$(MICRO_PROFILE_IMAGE_TAR).tmp" "$(MICRO_PROFILE_IMAGE_TAR)"
 
 image-runner-runtime-image-tar: $(if $(filter arm64,$(RUN_TARGET_ARCH)),arm64-runner-runtime-image-tar,x86-runner-runtime-image-tar)
 

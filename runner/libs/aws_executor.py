@@ -255,7 +255,8 @@ sudo docker info >/dev/null
     aws_common._ssh_exec(ctx, ip, "bash", "-c", script)
 
 def _remote_runtime_image_tar(ctx: aws_common.AwsExecutorContext) -> Path:
-    return runtime_container_image_tar_path(Path(ctx.remote_stage_dir), ctx.contract.identity.target_arch)
+    return runtime_container_image_tar_path(Path(ctx.remote_stage_dir), ctx.contract.identity.target_arch,
+                                            runtime_image=ctx.contract.remote.runtime_container_image)
 
 
 def _ensure_remote_runtime_image_loaded(ctx: aws_common.AwsExecutorContext, ip: str) -> None:
@@ -466,7 +467,8 @@ def _suite_results_relative_path(suite_name: str) -> str:
 
 
 def _sync_remote_roots(ctx: aws_common.AwsExecutorContext, ip: str) -> None:
-    image_tar = runtime_container_image_tar_path(ROOT_DIR, ctx.contract.identity.target_arch)
+    image_tar = runtime_container_image_tar_path(ROOT_DIR, ctx.contract.identity.target_arch,
+                                               runtime_image=ctx.contract.remote.runtime_container_image)
     try:
         relative_image_tar = image_tar.relative_to(ROOT_DIR).as_posix()
     except ValueError:

@@ -72,8 +72,9 @@ def runtime_workload_tools_root(workspace: Path, target_arch: str) -> Path:
         return image_artifact_root(target_arch, "workload-tools")
     return workload_tools_root(runtime_workspace(workspace), target_arch)
 
-def runtime_container_image_tar_path(workspace: Path, target_arch: str) -> Path:
-    return workspace / ".cache" / "container-images" / f"{str(target_arch).strip()}-runner-runtime.image.tar"
+def runtime_container_image_tar_path(workspace: Path, target_arch: str, *, runtime_image: str = "") -> Path:
+    profile = "micro-characterization" if runtime_image.startswith("bpf-benchmark/micro-characterization:") else "runner-runtime"
+    return workspace / ".cache" / "container-images" / f"{str(target_arch).strip()}-{profile}.image.tar"
 
 def kop_module_dir(workspace: Path, target_arch: str) -> Path:
     if inside_runtime_image():

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -10,6 +11,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,7 @@ from runner.libs.run_artifacts import (
 
 
 DEFAULT_RUNTIME_ORDER_SEED = 0
+DEFAULT_WARMUP_REPEAT = 5
 RUNTIME_COMMANDS = {
     "native": "run-native",
     "llvmbpf": "run-llvmbpf",
@@ -63,6 +66,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runtime", action="append", dest="runtimes", help="Runtime name.")
     parser.add_argument("--samples", type=int, help="Measured samples per runtime pair.")
     parser.add_argument("--warmups", type=int, help="Warmup runs per pair.")
+    parser.add_argument("--warmup-repeat", type=int, default=DEFAULT_WARMUP_REPEAT,
+                        help="Untimed inner-repeat batches inside each helper process (default: 5).")
     parser.add_argument("--inner-repeat", type=int, dest="inner_repeat", help="Repeat count inside each helper sample.")
     parser.add_argument("--perf-counters", action="store_true", help="Collect raw perf counters for measured samples.")
     parser.add_argument("--output", help="Override JSON output path.")
@@ -153,15 +158,19 @@ def collect_provenance(
     kernel_commit = _git_rev_parse(linux_dir) if linux_dir.is_dir() else "unknown"
     repo_git_sha = _git_rev_parse(ROOT_DIR)
     repo_dirty = _git_is_dirty(ROOT_DIR)
+    source_manifest = Path("/artifacts/source-manifest.json")
+    build_source = json.loads(source_manifest.read_text()) if source_manifest.is_file() else None
 
     return {
         "kernel_commit": kernel_commit,
         "repo_git_sha": repo_git_sha,
         "repo_dirty": repo_dirty,
+        "build_source": build_source,
         "params": {
             "samples": samples,
             "warmups": warmups,
             "inner_repeat": inner_repeat,
+            "warmup_repeat": args.warmup_repeat,
             "perf_counters": args.perf_counters,
         },
         "cpu_model": _read_cpu_model(),
@@ -189,6 +198,8 @@ def select_runtimes(names: list[str] | None, suite: SuiteSpec) -> list[RuntimeSp
     runtimes_by_name = {runtime.name: runtime for runtime in suite.runtimes}
     selected: list[RuntimeSpec] = []
     for name in requested:
+        if name in {runtime.name for runtime in selected}:
+            raise SystemExit(f"duplicate runtime: {name}")
         if name not in runtimes_by_name or name not in RUNTIME_COMMANDS:
             raise SystemExit(f"unknown runtime: {name}")
         selected.append(runtimes_by_name[name])
@@ -212,7 +223,7 @@ def require_suite_artifacts(
             if benchmark.native_kernel_object_path is None:
                 raise RuntimeError(f"{benchmark.name} is missing a native_kernel artifact path")
             required_paths.append(benchmark.native_kernel_object_path)
-        if "native_proof" in selected_runtime_names:
+        if "native_proof" in selected_runtime_names or "native_kernel" in selected_runtime_names:
             if benchmark.proof_object_path is None or benchmark.proof_compile_metadata_path is None:
                 raise RuntimeError(f"{benchmark.name} is missing native_proof artifact paths")
             required_paths.append(benchmark.proof_object_path)
@@ -253,6 +264,7 @@ def build_runner_command(
     benchmark: CatalogTarget,
     runtime: RuntimeSpec,
     inner_repeat: int,
+    warmup_repeat: int,
     perf_counters: bool,
     memory_file: Path | None,
     cpu: str | None,
@@ -297,7 +309,7 @@ def build_runner_command(
         command.extend(["--io-mode", benchmark.io_mode])
     if benchmark.kernel_input_size > 0:
         command.extend(["--input-size", str(benchmark.kernel_input_size)])
-    command.extend(["--inner-repeat", str(max(1, inner_repeat))])
+    command.extend(["--inner-repeat", str(inner_repeat), "--warmup", str(warmup_repeat)])
     if perf_counters:
         command.append("--perf-counters")
 
@@ -356,9 +368,69 @@ def run_rejit_sample(command: list[str], *, cwd: Path) -> dict[str, Any]:
 
 
 def run_runtime_sample(command: list[str], runtime_name: str, *, cwd: Path) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_ns = time.monotonic_ns()
     if runtime_name == "kernel_rejit":
-        return run_rejit_sample(command, cwd=cwd)
-    return run_single_sample(command, cwd=cwd)
+        sample = run_rejit_sample(command, cwd=cwd)
+    else:
+        sample = run_single_sample(command, cwd=cwd)
+    sample.update({
+        "runtime": runtime_name,
+        "command": command,
+        "process_started_at": started_at,
+        "process_completed_at": datetime.now(timezone.utc).isoformat(),
+        "process_elapsed_ns": time.monotonic_ns() - started_ns,
+    })
+    return sample
+
+
+def runtime_order_for_round(
+    runtimes: list[RuntimeSpec], *, seed: int, benchmark_name: str, round_index: int,
+) -> list[RuntimeSpec]:
+    ordered = list(runtimes)
+    random.Random(f"{seed}:{benchmark_name}:{round_index}").shuffle(ordered)
+    return ordered
+
+
+def validate_sample_protocol(sample: dict[str, Any], *, warmup_repeat: int) -> None:
+    measured_iterations = sample.get("measured_iterations")
+    if not isinstance(measured_iterations, int) or measured_iterations <= 0:
+        raise RuntimeError("micro_exec did not report positive measured_iterations")
+    if sample.get("warmup_batches") != warmup_repeat:
+        raise RuntimeError(f"micro_exec warmup_batches {sample.get('warmup_batches')} != {warmup_repeat}")
+    if sample.get("warmup_iterations") != warmup_repeat * measured_iterations:
+        raise RuntimeError("micro_exec warmup_iterations does not match warmup_batches * measured_iterations")
+    if not sample.get("timing_source"):
+        raise RuntimeError("micro_exec did not report timing_source")
+
+
+def file_identity(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path), "size_bytes": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def benchmark_file_identities(
+    benchmark: CatalogTarget, runtimes: list[RuntimeSpec], memory_file: Path | None,
+) -> dict[str, Any]:
+    paths = {"bpf_object": benchmark.object_path}
+    selected = {runtime.name for runtime in runtimes}
+    if "native" in selected:
+        paths["native_object"] = benchmark.native_object_path
+    if "native_kernel" in selected:
+        paths["native_kernel_object"] = benchmark.native_kernel_object_path
+    if "native_proof" in selected or "native_kernel" in selected:
+        paths["proof_object"] = benchmark.proof_object_path
+        paths["proof_compile_metadata"] = benchmark.proof_compile_metadata_path
+    if memory_file is not None:
+        paths["input"] = memory_file
+    base_name = str(benchmark.metadata.get("base_name") or benchmark.name)
+    source_path = ROOT_DIR / "micro" / "programs" / f"{base_name}.bpf.c"
+    if source_path.is_file():
+        paths["source"] = source_path
+    return {name: file_identity(path) for name, path in paths.items() if path is not None}
 
 
 def enrich_native_proof_sample(sample: dict[str, Any], benchmark: CatalogTarget) -> dict[str, Any]:
@@ -468,6 +540,16 @@ def main(argv: list[str] | None = None) -> int:
     samples = args.samples if args.samples is not None else suite.defaults.samples
     warmups = args.warmups if args.warmups is not None else suite.defaults.warmups
     default_inner_repeat = args.inner_repeat if args.inner_repeat is not None else suite.defaults.inner_repeat
+    if samples is None or samples <= 0:
+        raise SystemExit("samples must be > 0")
+    if warmups is None or warmups < 0 or args.warmup_repeat < 0:
+        raise SystemExit("warmups and warmup-repeat must be >= 0")
+    if default_inner_repeat is None or default_inner_repeat <= 0:
+        raise SystemExit("inner-repeat must be > 0")
+    for runtime in runtimes:
+        repeat = args.inner_repeat if args.inner_repeat is not None else runtime.default_inner_repeat
+        if repeat is None or repeat <= 0:
+            raise SystemExit(f"{runtime.name} inner-repeat must be > 0")
     if args.output:
         output_path = Path(args.output).resolve()
     else:
@@ -504,14 +586,18 @@ def main(argv: list[str] | None = None) -> int:
         },
         "build": {
             "runner_binary": str(runner_binary),
+            "runner_identity": file_identity(runner_binary),
+            "manifest_identity": file_identity(suite.manifest_path),
         },
         "defaults": {
             "samples": samples,
             "warmups": warmups,
             "inner_repeat": default_inner_repeat,
+            "warmup_repeat": args.warmup_repeat,
             "perf_counters": args.perf_counters,
             "shuffle_seed": args.shuffle_seed,
             "runtime_order_seed": runtime_order_seed,
+            "runtime_order_policy": "python-random-shuffle(seed:benchmark_name:round_index)",
         },
         "benchmarks": [],
     }
@@ -595,6 +681,9 @@ def main(argv: list[str] | None = None) -> int:
                 "expected_result": benchmark.expected_result,
                 "expected_retval": benchmark.expected_retval,
                 "input": str(memory_file) if memory_file else None,
+                "files": benchmark_file_identities(benchmark, benchmark_runtimes, memory_file),
+                "warmup_runs": [],
+                "rounds": [],
                 "runs": [],
             }
 
@@ -606,6 +695,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[bench] ({bench_idx+1}/{len(benchmarks)}) {benchmark.name}", flush=True)
 
             runtime_samples: dict[str, dict[str, object]] = {}
+            current_round: dict[str, Any] | None = None
+            available_affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+
+            def annotate_sample(sample: dict[str, Any]) -> None:
+                sample["cpu_affinity_requested"] = args.cpu
+                sample["cpu_affinity_available"] = available_affinity
 
             def sync_runtime_records(*, print_summary: bool = False) -> None:
                 recorded = {run["runtime"]: run for run in benchmark_record["runs"]}
@@ -621,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
                     payload = {
                         "runtime": runtime.name,
                         "inner_repeat": inner_repeat,
+                        "warmup_repeat": args.warmup_repeat,
                         "samples": run_samples,
                     }
                     if existing := recorded.get(runtime.name):
@@ -648,14 +744,20 @@ def main(argv: list[str] | None = None) -> int:
                         benchmark=benchmark,
                         runtime=runtime,
                         inner_repeat=inner_repeat,
+                        warmup_repeat=args.warmup_repeat,
                         perf_counters=False,
                         memory_file=memory_file,
                         cpu=args.cpu,
                     )
-                    for _ in range(max(0, warmups)):
+                    for warmup_index in range(warmups):
                         sample = run_runtime_sample(warmup_command, runtime.name, cwd=ROOT_DIR)
+                        annotate_sample(sample)
+                        sample["warmup_index"] = warmup_index
                         if runtime.name == "native_proof":
                             sample = enrich_native_proof_sample(sample, benchmark)
+                        benchmark_record["warmup_runs"].append(sample)
+                        flush_artifact("running")
+                        validate_sample_protocol(sample, warmup_repeat=args.warmup_repeat)
                         if benchmark.expected_result is not None and sample.get("result") != benchmark.expected_result:
                             raise RuntimeError(
                                 f"{benchmark.name}/{runtime.name} warmup result mismatch: "
@@ -668,14 +770,19 @@ def main(argv: list[str] | None = None) -> int:
                             )
 
                 for sample_idx in range(samples):
-                    if len(benchmark_runtimes) == 2:
-                        ordered = list(benchmark_runtimes) if sample_idx % 2 == 0 else list(reversed(benchmark_runtimes))
-                    else:
-                        rng = random.Random(runtime_order_seed + sample_idx)
-                        ordered = list(benchmark_runtimes)
-                        rng.shuffle(ordered)
+                    ordered = runtime_order_for_round(
+                        benchmark_runtimes, seed=runtime_order_seed,
+                        benchmark_name=benchmark.name, round_index=sample_idx,
+                    )
+                    current_round = {
+                        "round_index": sample_idx,
+                        "runtime_order": [],
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "running",
+                    }
+                    benchmark_record["rounds"].append(current_round)
 
-                    for runtime in ordered:
+                    for order_index, runtime in enumerate(ordered):
                         inner_repeat = int(runtime_samples[runtime.name]["inner_repeat"])
                         dump_jit_path = None
                         dump_xlated_path = None
@@ -690,16 +797,27 @@ def main(argv: list[str] | None = None) -> int:
                             benchmark=benchmark,
                             runtime=runtime,
                             inner_repeat=inner_repeat,
+                            warmup_repeat=args.warmup_repeat,
                             perf_counters=args.perf_counters,
                             memory_file=memory_file,
                             cpu=args.cpu,
                             dump_jit_path=dump_jit_path,
                             dump_xlated_path=dump_xlated_path,
                         )
+                        current_round["runtime_order"].append(runtime.name)
+                        flush_artifact("running")
                         sample = run_runtime_sample(command, runtime.name, cwd=ROOT_DIR)
+                        annotate_sample(sample)
                         if runtime.name == "native_proof":
                             sample = enrich_native_proof_sample(sample, benchmark)
                         sample["sample_index"] = sample_idx
+                        sample["round_index"] = sample_idx
+                        sample["runtime_order_index"] = order_index
+
+                        runtime_samples[runtime.name]["samples"].append(sample)
+                        sync_runtime_records()
+                        flush_artifact("running")
+                        validate_sample_protocol(sample, warmup_repeat=args.warmup_repeat)
 
                         if benchmark.expected_result is not None and sample.get("result") != benchmark.expected_result:
                             raise RuntimeError(
@@ -712,13 +830,18 @@ def main(argv: list[str] | None = None) -> int:
                                 f"{sample.get('retval')} != {benchmark.expected_retval}"
                             )
 
-                        runtime_samples[runtime.name]["samples"].append(sample)
-                        sync_runtime_records()
-                        flush_artifact("running")
+                    current_round["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    current_round["status"] = "completed"
+                    current_round = None
+                    flush_artifact("running")
 
                 sync_runtime_records(print_summary=True)
                 flush_artifact("running")
             except Exception as exc:
+                if current_round is not None:
+                    current_round["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    current_round["status"] = "error"
+                    current_round["error"] = str(exc)
                 sync_runtime_records(print_summary=True)
                 benchmark_record["error"] = str(exc)
                 benchmark_errors.append(f"{benchmark.name}: {exc}")

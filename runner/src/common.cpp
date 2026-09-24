@@ -1,5 +1,6 @@
 #include "micro_exec.hpp"
 
+#include <charconv>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -17,17 +18,29 @@ std::string usage_text()
         "[--warmup N] [--input-size N] [--perf-counters] [--dump-jit] [--dump-jit-path <path>] "
         "[--dump-xlated <path>] [--wait-signal]\n"
         "  micro_exec run-native [--program <path>|<path>] --native-program <path> "
-        "[--memory <path>] [--io-mode staged|packet] [--inner-repeat N] [--input-size N] "
+        "[--memory <path>] [--io-mode staged|packet] [--inner-repeat N] [--warmup N] [--input-size N] "
         "[--perf-counters]\n"
         "  micro_exec run-native-kernel [--program <path>|<path>] --native-program <path> "
         "[--memory <path>] [--io-mode staged|packet] [--native-kernel-prog-type xdp|sched_cls|cgroup_skb] "
-        "[--inner-repeat N] [--input-size N] [--perf-counters]\n"
+        "[--inner-repeat N] [--warmup N] [--input-size N] [--perf-counters]\n"
 #ifdef MICRO_EXEC_ENABLE_LLVMBPF
         "  micro_exec run-llvmbpf [--program <path>|<path>] "
         "[--memory <path>] [--io-mode map|staged|packet] [--raw-packet] "
-        "[--inner-repeat N] [--input-size N] [--perf-counters] [--dump-jit] [--dump-jit-path <path>]\n"
+        "[--inner-repeat N] [--warmup N] [--input-size N] [--perf-counters] [--dump-jit] [--dump-jit-path <path>]\n"
 #endif
-        "  micro_exec list-programs [--program <path>|<path>]";
+        "  micro_exec list-programs [--program <path>|<path>]\n"
+        "  --warmup N: N same-process batches before measurement (default 5); "
+        "each batch uses --inner-repeat iterations; 0 disables warmup.";
+}
+
+uint32_t parse_repeat_count(std::string_view value, std::string_view option)
+{
+    uint32_t parsed = 0;
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc() || end != value.data() + value.size()) {
+        fail(std::string(option) + " must be an integer between 0 and 4294967295");
+    }
+    return parsed;
 }
 
 void validate_cli_options(const cli_options &options)
@@ -76,7 +89,10 @@ void print_sample_json(std::ostream &out, const sample_result &sample)
     out
         << "{"
         << "\"compile_ns\":" << sample.compile_ns << ","
-        << "\"exec_ns\":" << sample.exec_ns;
+        << "\"exec_ns\":" << sample.exec_ns << ","
+        << "\"measured_iterations\":" << sample.measured_iterations << ","
+        << "\"warmup_batches\":" << sample.warmup_batches << ","
+        << "\"warmup_iterations\":" << sample.warmup_iterations;
     out
         << ",\"timing_source\":\"" << json_escape(sample.timing_source) << "\""
         << ",\"timing_source_wall\":\"" << json_escape(sample.timing_source_wall) << "\"";
@@ -88,10 +104,9 @@ void print_sample_json(std::ostream &out, const sample_result &sample)
         out << "null";
     }
     if (sample.exec_cycles.has_value()) {
-        out << ",\"exec_cycles\":" << *sample.exec_cycles;
-    }
-    if (sample.tsc_freq_hz.has_value()) {
-        out << ",\"tsc_freq_hz\":" << *sample.tsc_freq_hz;
+        out << ",\"exec_cycles\":" << *sample.exec_cycles
+            << ",\"exec_cycles_source\":\"" << json_escape(sample.exec_cycles_source) << "\""
+            << ",\"exec_cycles_scope\":\"" << json_escape(sample.exec_cycles_scope) << "\"";
     }
 
     out
@@ -301,11 +316,11 @@ cli_options parse_args(int argc, char **argv)
             continue;
         }
         if (current == "--inner-repeat" && index + 1 < argc) {
-            options.repeat = static_cast<uint32_t>(std::stoul(argv[++index]));
+            options.repeat = parse_repeat_count(argv[++index], current);
             continue;
         }
         if (current == "--warmup" && index + 1 < argc) {
-            options.warmup_repeat = static_cast<uint32_t>(std::stoul(argv[++index]));
+            options.warmup_repeat = parse_repeat_count(argv[++index], current);
             continue;
         }
         if (current == "--input-size" && index + 1 < argc) {

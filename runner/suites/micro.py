@@ -48,6 +48,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.runtimes = env_tokens("RUNTIMES") or None
     args.samples = env_int("SAMPLES", 3, _die, positive=True)
     args.warmups = env_int("WARMUPS", 0, _die)
+    args.warmup_repeat = env_int("WARMUP_REPEAT", 5, _die)
     args.inner_repeat = env_int("INNER_REPEAT", 100000, _die, positive=True)
     args.output = env_str("MICRO_OUTPUT")
     args.cpu = env_str("CPU")
@@ -60,7 +61,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _selected_runtimes(args: argparse.Namespace) -> list[str]:
-    return args.runtimes or ["native", "llvmbpf", "kernel"]
+    selected = args.runtimes or ["native", "llvmbpf", "kernel"]
+    if env_str("BPFREJIT_MICRO_IMAGE_PROFILE") == "characterization":
+        if set(selected) - {"native", "llvmbpf", "kernel", "native_kernel"}:
+            _die("characterization image supports native, llvmbpf, kernel, and native_kernel only")
+        expected_suite = Path(args.workspace) / "micro" / "config" / "micro_pure_jit.yaml"
+        if args.suite and resolve_workspace_path(Path(args.workspace), args.suite) != expected_suite.resolve():
+            _die("characterization image supports micro/config/micro_pure_jit.yaml only")
+        if args.program_dir:
+            _die("characterization image does not support a MICRO_PROGRAM_DIR override")
+    return selected
 
 
 def _runtime_env(workspace: Path, args: argparse.Namespace) -> dict[str, str]:
@@ -77,6 +87,9 @@ def _runtime_env(workspace: Path, args: argparse.Namespace) -> dict[str, str]:
     env["BPFREJIT_KERNEL_MODULES_ROOT"] = str(kernel_modules_dir)
     env["PYTHONPATH"] = str(workspace)
     env["BPFTOOL_BIN"] = args.bpftool_bin
+    for name in ("BPFREJIT_NATIVE_LOADER_REQUIRE_PREBUILT_PROOF", "BPFREJIT_NATIVE_LINK_BINARY"):
+        if value := env_str(name):
+            env[name] = value
     return env
 
 
@@ -91,6 +104,7 @@ def _micro_driver_argv(workspace: Path, args: argparse.Namespace) -> list[str]:
     argv.extend([
         "--samples", str(args.samples),
         "--warmups", str(args.warmups),
+        "--warmup-repeat", str(args.warmup_repeat),
         "--inner-repeat", str(args.inner_repeat),
         "--output", str(output_path),
     ])

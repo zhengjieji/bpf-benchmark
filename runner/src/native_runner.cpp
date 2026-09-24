@@ -72,6 +72,26 @@ sample_result run_native(const cli_options &options) {
     skb.set_data_end(data_end_ptr);
     skb.set_len(static_cast<uint32_t>(data_end_ptr - data_ptr));
     uint32_t retval = 0; const uint32_t repeat = options.repeat > 0 ? options.repeat : 1;
+    const auto initial_packet = packet;
+    const auto initial_skb = skb;
+    const auto initial_xdp = xdp;
+    const auto reset_batch_input = [&]() {
+        std::memcpy(packet.data(), initial_packet.data(), packet.size());
+        skb = initial_skb;
+        xdp = initial_xdp;
+    };
+    const auto run_batch = [&]() {
+        for (uint32_t index = 0; index < repeat; ++index)
+            retval = static_cast<uint32_t>(fn(is_skb ? static_cast<void *>(skb.storage) : static_cast<void *>(&xdp)));
+    };
+    set_active_userspace_bpf_map_state(image.maps.empty() ? nullptr : &map_state);
+    for (uint32_t warmup_index = 0; warmup_index < options.warmup_repeat; ++warmup_index) {
+        reset_batch_input();
+        run_batch();
+    }
+    // Each kernel test-run batch starts from data_in again. Do the same here
+    // so warmup cannot change the packet supplied to the measured batch.
+    reset_batch_input();
     clock_type::time_point exec_start {};
     clock_type::time_point exec_end {};
     const perf_counter_options perf_options {
@@ -79,17 +99,17 @@ sample_result run_native(const cli_options &options) {
         .include_kernel = false,
     };
     auto perf_counters = measure_perf_counters(perf_options, [&]() {
-        set_active_userspace_bpf_map_state(image.maps.empty() ? nullptr : &map_state);
         exec_start = clock_type::now();
-        for (uint32_t index = 0; index < repeat; ++index)
-            retval = static_cast<uint32_t>(fn(is_skb ? static_cast<void *>(skb.storage) : static_cast<void *>(&xdp)));
+        run_batch();
         exec_end = clock_type::now();
-        set_active_userspace_bpf_map_state(nullptr);
     });
     set_active_userspace_bpf_map_state(nullptr);
     uint64_t packet_result = 0; std::memcpy(&packet_result, data, sizeof(packet_result));
     const uint64_t result = is_skb ? skb.read_result() : packet_result;
     sample_result sample {.compile_ns = elapsed_ns(load_start, load_end), .exec_ns = elapsed_ns(exec_start, exec_end) / repeat};
+    sample.measured_iterations = repeat;
+    sample.warmup_batches = options.warmup_repeat;
+    sample.warmup_iterations = static_cast<uint64_t>(options.warmup_repeat) * repeat;
     sample.timing_source = "clock_monotonic"; sample.timing_source_wall = "clock_monotonic"; sample.wall_exec_ns = sample.exec_ns;
     sample.result = result;
     sample.retval = retval; sample.code_size = {.bpf_bytecode_bytes = image.code.size(), .native_code_bytes = native_code_bytes};

@@ -57,6 +57,7 @@ struct cli_options {
     std::string io_mode = "map";
     bool raw_packet = false;
     uint32_t repeat = 1;
+    // Same-process warmup batches; each batch executes repeat iterations.
     uint32_t warmup_repeat = 5;
     uint32_t input_size = 0;
     bool perf_counters = false;
@@ -102,11 +103,15 @@ struct code_size_summary {
 struct sample_result {
     uint64_t compile_ns = 0;
     uint64_t exec_ns = 0;
+    uint32_t measured_iterations = 0;
+    uint32_t warmup_batches = 0;
+    uint64_t warmup_iterations = 0;
     std::string timing_source = "unknown";
     std::string timing_source_wall = "unavailable";
     std::optional<uint64_t> wall_exec_ns;
     std::optional<uint64_t> exec_cycles;
-    std::optional<uint64_t> tsc_freq_hz;
+    std::string exec_cycles_source = "unavailable";
+    std::string exec_cycles_scope = "unavailable";
     uint64_t result = 0;
     uint32_t retval = 0;
     perf_counter_capture perf_counters;

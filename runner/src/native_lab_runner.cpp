@@ -248,21 +248,26 @@ std::vector<sample_result> run_native_kernel(const cli_options &options)
         prog_type_value == BPF_PROG_TYPE_CGROUP_SKB;
     __sk_buff context_out = {};
 
-    // Warmup (1 iteration to populate caches + verify mechanism).
-    bpf_test_run_opts warm = {};
-    warm.sz = sizeof(warm);
-    warm.repeat = 1;
-    warm.data_in = packet.data();
-    warm.data_size_in = packet.size();
-    warm.data_out = packet_out.data();
-    warm.data_size_out = packet_out.size();
-    if (result_from_skb_context) {
-        warm.ctx_out = &context_out;
-        warm.ctx_size_out = sizeof(context_out);
-    }
-    if (bpf_prog_test_run_opts(prog_fd, &warm) < 0) {
-        close_native_program();
-        fail(std::string("warmup test_run failed: ") + std::strerror(errno));
+    // Match test-run: warm up full repeat-sized batches on the loaded program,
+    // outside both the reported duration and the perf-counter interval.
+    for (uint32_t warmup_index = 0; warmup_index < options.warmup_repeat; ++warmup_index) {
+        std::fill(packet_out.begin(), packet_out.end(), 0);
+        std::memset(&context_out, 0, sizeof(context_out));
+        bpf_test_run_opts warm = {};
+        warm.sz = sizeof(warm);
+        warm.repeat = options.repeat;
+        warm.data_in = packet.data();
+        warm.data_size_in = packet.size();
+        warm.data_out = packet_out.data();
+        warm.data_size_out = packet_out.size();
+        if (result_from_skb_context) {
+            warm.ctx_out = &context_out;
+            warm.ctx_size_out = sizeof(context_out);
+        }
+        if (bpf_prog_test_run_opts(prog_fd, &warm) != 0) {
+            close_native_program();
+            fail(std::string("warmup test_run failed: ") + std::strerror(errno));
+        }
     }
 
     // Measured run.
@@ -313,9 +318,12 @@ std::vector<sample_result> run_native_kernel(const cli_options &options)
     sample_result sample;
     sample.compile_ns = native_load_ns;
     sample.exec_ns = test_opts.duration;  // kernel reports per-iter ns
+    sample.measured_iterations = options.repeat;
+    sample.warmup_batches = options.warmup_repeat;
+    sample.warmup_iterations = static_cast<uint64_t>(options.warmup_repeat) * options.repeat;
     sample.timing_source = "ktime";
-    sample.timing_source_wall = "wall_steady";
-    sample.wall_exec_ns = elapsed_ns(run_start, run_end);
+    sample.timing_source_wall = "clock_monotonic";
+    sample.wall_exec_ns = elapsed_ns(run_start, run_end) / options.repeat;
     sample.result = result_word;
     sample.retval = test_opts.retval;
     sample.perf_counters = std::move(perf_counters);

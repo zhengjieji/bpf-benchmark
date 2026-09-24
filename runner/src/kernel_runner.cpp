@@ -12,18 +12,15 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <fstream>
 #include <iostream>
 #include <signal.h>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <thread>
 #include <unordered_map>
 #include <unistd.h>
 #include <utility>
@@ -76,7 +73,6 @@ struct kernel_probe_context {
     int program_fd = -1;
     bpf_test_run_opts *test_opts = nullptr;
     uint32_t effective_repeat = 1;
-    uint64_t tsc_freq_hz = 0;
     std::vector<uint8_t> *packet_out = nullptr;
     __sk_buff *context_out = nullptr;
     uint32_t context_out_size = 0;
@@ -166,100 +162,6 @@ struct live_fixture_map {
     int fd = -1;
 };
 
-std::optional<uint64_t> read_nominal_tsc_freq_hz()
-{
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    if (!cpuinfo.is_open()) {
-        return std::nullopt;
-    }
-
-    std::string line;
-    while (std::getline(cpuinfo, line)) {
-        if (!line.starts_with("model name")) {
-            continue;
-        }
-
-        const auto at_pos = line.rfind('@');
-        if (at_pos == std::string::npos) {
-            continue;
-        }
-
-        const auto value_start = line.find_first_of("0123456789", at_pos);
-        if (value_start == std::string::npos) {
-            continue;
-        }
-
-        const auto value_end = line.find_first_not_of("0123456789.", value_start);
-        if (value_end == std::string::npos) {
-            continue;
-        }
-
-        const auto unit_start = line.find_first_not_of(" \t", value_end);
-        if (unit_start == std::string::npos) {
-            continue;
-        }
-
-        const auto unit_end =
-            line.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", unit_start);
-        const auto unit = line.substr(
-            unit_start,
-            unit_end == std::string::npos ? std::string::npos : unit_end - unit_start);
-
-        long double multiplier = 0.0L;
-        if (unit == "GHz") {
-            multiplier = 1000000000.0L;
-        } else if (unit == "MHz") {
-            multiplier = 1000000.0L;
-        } else if (unit == "KHz") {
-            multiplier = 1000.0L;
-        } else {
-            continue;
-        }
-
-        try {
-            const auto value = std::stold(line.substr(value_start, value_end - value_start));
-            return static_cast<uint64_t>(std::llround(value * multiplier));
-        } catch (const std::exception &) {
-            continue;
-        }
-    }
-
-    return std::nullopt;
-}
-
-uint64_t calibrate_tsc_freq_hz()
-{
-    constexpr auto calibration_window = std::chrono::milliseconds(20);
-
-    const auto wall_start = clock_type::now();
-    const auto tsc_start = rdtsc_start();
-    std::this_thread::sleep_for(calibration_window);
-    const auto tsc_end = rdtsc_end();
-    const auto wall_end = clock_type::now();
-
-    const uint64_t wall_ns = elapsed_ns(wall_start, wall_end);
-    if (wall_ns == 0 || tsc_end <= tsc_start) {
-        fail("unable to calibrate TSC frequency");
-    }
-
-    const long double freq_hz =
-        (static_cast<long double>(tsc_end - tsc_start) * 1000000000.0L) /
-        static_cast<long double>(wall_ns);
-    return static_cast<uint64_t>(std::llround(freq_hz));
-}
-
-uint64_t detect_tsc_freq_hz()
-{
-    if constexpr (!kHasTscMeasurement) {
-        fail("rdtsc timing requires x86/x86_64");
-    }
-
-    if (const auto nominal = read_nominal_tsc_freq_hz(); nominal.has_value()) {
-        return *nominal;
-    }
-    return calibrate_tsc_freq_hz();
-}
-
 } // namespace
 
 size_t packet_output_capacity(const cli_options &, size_t packet_size)
@@ -319,16 +221,11 @@ kernel_run_measurement execute_kernel_probe(kernel_probe_context &context)
     measurement.retval = context.test_opts->retval;
     measurement.wall_start = wall_start;
     measurement.wall_end = wall_end;
+    measurement.wall_exec_ns = elapsed_ns(wall_start, wall_end) / context.effective_repeat;
 
-    if (kHasTscMeasurement && context.tsc_freq_hz > 0 && tsc_after > tsc_before) {
+    if (kHasTscMeasurement && tsc_after > tsc_before) {
         const uint64_t total_cycles = tsc_after - tsc_before;
-        measurement.exec_cycles = static_cast<uint64_t>(std::llround(
-            static_cast<long double>(total_cycles) /
-            static_cast<long double>(context.effective_repeat)));
-        measurement.wall_exec_ns = static_cast<uint64_t>(std::llround(
-            (static_cast<long double>(total_cycles) * 1000000000.0L) /
-            (static_cast<long double>(context.tsc_freq_hz) *
-             static_cast<long double>(context.effective_repeat))));
+        measurement.exec_cycles = total_cycles / context.effective_repeat;
     }
 
     return measurement;
@@ -1101,12 +998,10 @@ std::vector<sample_result> run_kernel(const cli_options &options)
         test_opts.ctx_size_out = sizeof(context_out);
     }
 
-    const uint64_t tsc_freq_hz = kHasTscMeasurement ? detect_tsc_freq_hz() : 0;
     kernel_probe_context run_context = {
         .program_fd = program_fd,
         .test_opts = &test_opts,
         .effective_repeat = effective_repeat,
-        .tsc_freq_hz = tsc_freq_hz,
         .packet_out = packet_out.empty() ? nullptr : &packet_out,
         .context_out = result_from_skb_context ? &context_out : nullptr,
         .context_out_size = static_cast<uint32_t>(sizeof(context_out)),
@@ -1141,13 +1036,15 @@ std::vector<sample_result> run_kernel(const cli_options &options)
         elapsed_ns(object_open_start, object_open_end) +
         elapsed_ns(object_load_start, object_load_end);
     sample.exec_ns = run_measurement.exec_ns;
+    sample.measured_iterations = effective_repeat;
+    sample.warmup_batches = options.warmup_repeat;
+    sample.warmup_iterations = static_cast<uint64_t>(options.warmup_repeat) * effective_repeat;
     sample.timing_source = "ktime";
-    sample.timing_source_wall =
-        run_measurement.wall_exec_ns.has_value() ? "rdtsc" : "unavailable";
+    sample.timing_source_wall = "clock_monotonic";
     sample.wall_exec_ns = run_measurement.wall_exec_ns;
     sample.exec_cycles = run_measurement.exec_cycles;
-    sample.tsc_freq_hz =
-        tsc_freq_hz > 0 ? std::optional<uint64_t>(tsc_freq_hz) : std::nullopt;
+    sample.exec_cycles_source = "tsc_ticks";
+    sample.exec_cycles_scope = "test_run_syscall_per_iteration";
     sample.result = result;
     sample.retval = run_measurement.retval;
     sample.perf_counters = std::move(run_pass.perf_counters);

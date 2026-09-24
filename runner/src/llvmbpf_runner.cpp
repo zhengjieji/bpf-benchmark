@@ -4,16 +4,10 @@
 #include <llvmbpf.hpp>
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <fstream>
 #include <memory>
-#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <utility>
@@ -33,46 +27,6 @@ constexpr uintptr_t kLow32SearchEnd = 0x100000000ULL;
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
-
-#if defined(__x86_64__) || defined(__i386__)
-constexpr bool kHasTscMeasurement = true;
-
-static inline uint64_t rdtsc_start()
-{
-    unsigned int lo, hi;
-    asm volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
-    return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-static inline uint64_t rdtsc_end()
-{
-    unsigned int lo, hi;
-    asm volatile("rdtsc; lfence" : "=a"(lo), "=d"(hi) :: "memory");
-    return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-#else
-constexpr bool kHasTscMeasurement = false;
-
-static inline uint64_t rdtsc_start()
-{
-    return 0;
-}
-
-static inline uint64_t rdtsc_end()
-{
-    return 0;
-}
-#endif
-
-uint64_t monotonic_now_ns()
-{
-    timespec ts {};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        fail("clock_gettime(CLOCK_MONOTONIC) failed: " + std::string(strerror(errno)));
-    }
-
-    return (static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL) + static_cast<uint64_t>(ts.tv_nsec);
-}
 
 size_t page_size()
 {
@@ -147,66 +101,6 @@ void *map_low_u32_region(size_t size)
     fail("unable to allocate llvmbpf packet buffer below 4 GiB for packet context");
 }
 
-std::optional<uint64_t> read_nominal_tsc_freq_hz()
-{
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    if (!cpuinfo.is_open()) {
-        return std::nullopt;
-    }
-
-    std::string line;
-    while (std::getline(cpuinfo, line)) {
-        if (!line.starts_with("model name")) {
-            continue;
-        }
-
-        const auto at_pos = line.rfind('@');
-        if (at_pos == std::string::npos) {
-            continue;
-        }
-
-        const auto value_start = line.find_first_of("0123456789", at_pos);
-        if (value_start == std::string::npos) {
-            continue;
-        }
-
-        const auto value_end = line.find_first_not_of("0123456789.", value_start);
-        if (value_end == std::string::npos) {
-            continue;
-        }
-
-        const auto unit_start = line.find_first_not_of(" \t", value_end);
-        if (unit_start == std::string::npos) {
-            continue;
-        }
-
-        const auto unit_end = line.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", unit_start);
-        const auto unit = line.substr(
-            unit_start,
-            unit_end == std::string::npos ? std::string::npos : unit_end - unit_start);
-
-        long double multiplier = 0.0L;
-        if (unit == "GHz") {
-            multiplier = 1000000000.0L;
-        } else if (unit == "MHz") {
-            multiplier = 1000000.0L;
-        } else if (unit == "KHz") {
-            multiplier = 1000.0L;
-        } else {
-            continue;
-        }
-
-        try {
-            const auto value = std::stold(line.substr(value_start, value_end - value_start));
-            return static_cast<uint64_t>(std::llround(value * multiplier));
-        } catch (const std::exception &) {
-            continue;
-        }
-    }
-
-    return std::nullopt;
-}
-
 template <typename VM>
 int configure_no_cmov(VM &vm, bool enabled)
 {
@@ -215,40 +109,6 @@ int configure_no_cmov(VM &vm, bool enabled)
     }
 
     return enabled ? -1 : 0;
-}
-
-uint64_t calibrate_tsc_freq_hz()
-{
-    constexpr auto calibration_window = std::chrono::milliseconds(20);
-
-    const auto wall_start = clock_type::now();
-    const auto tsc_start = rdtsc_start();
-    std::this_thread::sleep_for(calibration_window);
-    const auto tsc_end = rdtsc_end();
-    const auto wall_end = clock_type::now();
-
-    const uint64_t wall_ns = elapsed_ns(wall_start, wall_end);
-    if (wall_ns == 0 || tsc_end <= tsc_start) {
-        fail("unable to calibrate TSC frequency");
-    }
-
-    const long double freq_hz =
-        (static_cast<long double>(tsc_end - tsc_start) * 1000000000.0L) /
-        static_cast<long double>(wall_ns);
-    return static_cast<uint64_t>(std::llround(freq_hz));
-}
-
-std::optional<uint64_t> detect_tsc_freq_hz()
-{
-    if constexpr (!kHasTscMeasurement) {
-        return std::nullopt;
-    }
-
-    if (const auto nominal = read_nominal_tsc_freq_hz(); nominal.has_value()) {
-        return *nominal;
-    }
-
-    return calibrate_tsc_freq_hz();
 }
 
 struct xdp_md_ctx {
@@ -515,57 +375,49 @@ sample_result run_llvmbpf(const cli_options &options)
 
     uint64_t retval = 0;
     uint64_t result = 0;
-    uint64_t total_exec_cycles = 0;
     uint64_t total_exec_ns = 0;
-    const auto tsc_freq_hz = detect_tsc_freq_hz();
-    const bool use_tsc_timing = tsc_freq_hz.has_value();
     const uint32_t repeat = options.repeat > 0 ? options.repeat : 1;
     set_active_userspace_bpf_map_state(!image.maps.empty() ? &map_state : nullptr);
     clock_type::time_point exec_start {};
     clock_type::time_point exec_end {};
-    const auto run_timed_repeat = [&](auto &&exec_once) {
-        const uint64_t measure_start =
-            use_tsc_timing ? rdtsc_start() : monotonic_now_ns();
+    const auto run_repeat = [&](auto &&exec_once, bool measured) {
+        const auto measure_start = measured ? clock_type::now() : clock_type::time_point {};
         for (uint32_t index = 0; index < repeat; ++index) {
             exec_once();
         }
-        const uint64_t measure_end =
-            use_tsc_timing ? rdtsc_end() : monotonic_now_ns();
-        if (use_tsc_timing) {
-            total_exec_cycles += measure_end - measure_start;
-        } else {
-            total_exec_ns += measure_end - measure_start;
+        if (measured) {
+            total_exec_ns = elapsed_ns(measure_start, clock_type::now());
         }
     };
-    const auto run_map_repeat = [&](uint8_t *ctx, size_t ctx_size) {
-        run_timed_repeat([&]() {
+    const auto run_map_repeat = [&](uint8_t *ctx, size_t ctx_size, bool measured) {
+        run_repeat([&]() {
             if (vm.exec(ctx, ctx_size, retval) < 0) {
                 fail("llvmbpf exec failed: " + vm.get_error_message());
             }
-        });
+        }, measured);
     };
-    const auto run_packet_repeat = [&](xdp_md_ctx &ctx) {
-        run_timed_repeat([&]() {
+    const auto run_packet_repeat = [&](xdp_md_ctx &ctx, bool measured) {
+        run_repeat([&]() {
             if (vm.exec(&ctx, sizeof(ctx), retval) < 0) {
                 fail("llvmbpf exec failed: " + vm.get_error_message());
             }
-        });
+        }, measured);
     };
-    const auto run_skb_repeat = [&](sk_buff_ctx &ctx) {
-        run_timed_repeat([&]() {
+    const auto run_skb_repeat = [&](sk_buff_ctx &ctx, bool measured) {
+        run_repeat([&]() {
             if (vm.exec(&ctx, sizeof(ctx), retval) < 0) {
                 fail("llvmbpf exec failed: " + vm.get_error_message());
             }
-        });
+        }, measured);
     };
-    const auto run_packet_context = [&](lowmem_buffer &packet_buffer)
+    const auto run_packet_context = [&](lowmem_buffer &packet_buffer, bool measured)
         -> std::optional<uint64_t> {
         const auto packet_address = reinterpret_cast<uintptr_t>(packet_buffer.data());
         if (packet_kind == packet_context_kind::xdp) {
             xdp_md_ctx ctx = {};
             ctx.data = static_cast<uint32_t>(packet_address);
             ctx.data_end = static_cast<uint32_t>(packet_address + packet_buffer.size());
-            run_packet_repeat(ctx);
+            run_packet_repeat(ctx, measured);
             return std::nullopt;
         }
         if (packet_kind == packet_context_kind::skb) {
@@ -579,26 +431,28 @@ sample_result run_llvmbpf(const cli_options &options)
             ctx.data = static_cast<uint32_t>(packet_address + data_offset);
             ctx.data_end = static_cast<uint32_t>(packet_address + packet_buffer.size());
             ctx.data_meta = ctx.data;
-            run_skb_repeat(ctx);
+            run_skb_repeat(ctx, measured);
             return read_skb_result(ctx);
         }
         fail("io-mode requires an XDP or skb packet context");
     };
 
-    const perf_counter_options perf_options {
-        .enabled = options.perf_counters,
-        .include_kernel = false,
-    };
-    auto perf_counters = measure_perf_counters(perf_options, [&]() {
-        exec_start = clock_type::now();
+    const auto run_batch = [&](bool measured) {
+        if (result_from_map) {
+            auto *result_map = map_state.find_by_name("result_map");
+            if (result_map == nullptr) {
+                fail("result_map not found in userspace BPF map state");
+            }
+            std::fill(result_map->storage.begin(), result_map->storage.end(), 0);
+        }
         if (packet_input.empty()) {
             uint8_t dummy_ctx[8] = {};
-            run_map_repeat(dummy_ctx, sizeof(dummy_ctx));
+            run_map_repeat(dummy_ctx, sizeof(dummy_ctx), measured);
         } else {
             lowmem_buffer packet_buffer(packet_input.size());
             std::memcpy(packet_buffer.data(), packet_input.data(), packet_input.size());
 
-            const auto skb_result = run_packet_context(packet_buffer);
+            const auto skb_result = run_packet_context(packet_buffer, measured);
             if (!result_from_map) {
                 if (skb_result.has_value()) {
                     result = *skb_result;
@@ -609,23 +463,27 @@ sample_result run_llvmbpf(const cli_options &options)
                 }
             }
         }
+    };
+    for (uint32_t warmup_index = 0; warmup_index < options.warmup_repeat; ++warmup_index) {
+        run_batch(false);
+    }
+    const perf_counter_options perf_options {
+        .enabled = options.perf_counters,
+        .include_kernel = false,
+    };
+    auto perf_counters = measure_perf_counters(perf_options, [&]() {
+        exec_start = clock_type::now();
+        run_batch(true);
         exec_end = clock_type::now();
     });
     set_active_userspace_bpf_map_state(nullptr);
 
-    if (tsc_freq_hz.has_value()) {
-        sample.exec_ns = static_cast<uint64_t>(std::llround(
-            (static_cast<long double>(total_exec_cycles) * 1000000000.0L) /
-            (static_cast<long double>(*tsc_freq_hz) * static_cast<long double>(repeat))));
-        sample.exec_cycles = static_cast<uint64_t>(std::llround(
-            static_cast<long double>(total_exec_cycles) / static_cast<long double>(repeat)));
-        sample.tsc_freq_hz = *tsc_freq_hz;
-        sample.timing_source = "rdtsc";
-    } else {
-        sample.exec_ns = static_cast<uint64_t>(std::llround(
-            static_cast<long double>(total_exec_ns) / static_cast<long double>(repeat)));
-        sample.timing_source = "clock_monotonic";
-    }
+    sample.exec_ns = total_exec_ns / repeat;
+    sample.measured_iterations = repeat;
+    sample.warmup_batches = options.warmup_repeat;
+    sample.warmup_iterations = static_cast<uint64_t>(options.warmup_repeat) * repeat;
+    sample.timing_source = "clock_monotonic";
+    sample.timing_source_wall = "clock_monotonic";
     sample.wall_exec_ns = elapsed_ns(exec_start, exec_end) / repeat;
     sample.perf_counters = std::move(perf_counters);
     sample.result = result_from_map ? read_userspace_bpf_result_value(map_state) : result;
